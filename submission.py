@@ -11,20 +11,24 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from itertools import permutations, product
 
 EPISODE_STEPS = 200
 STARTING = 1000
 BOARD_SIZE = 10
 PLAYERS = 2
+GAMMA = 0.9
 EGREEDY = 0.4
+EGREEDY_DECAY = 0.4
 BATCH_SIZE = 32
 LEARNING_RATE = 0.1
 MOMENTUM  = 0.9
 EPOCHS = 3
+MAX_ACTION_SPACE = 1000
 WEIGHT_DECAY = 5e-4
-SHIPYARD_ACTIONS = [ShipyardAction.SPAWN, None]
-SHIP_ACTIONS = [ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST,None,ShipAction.CONVERT]
-SHIP_MOVE_ACTIONS = [ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST,None]
+SHIPYARD_ACTIONS = [None, ShipyardAction.SPAWN]
+SHIP_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST,ShipAction.CONVERT]
+SHIP_MOVE_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST]
 
 class Net(nn.Module):
     def __init__(self, in_features):
@@ -89,7 +93,8 @@ shipyards_spawned = 0
 halite_lost = 0
 halite_stolen = 0
  
-criterion = nn.CrossEntropyLoss()
+# criterion = nn.CrossEntropyLoss()
+criterion = nn.SmoothL1Loss()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 net = Net(ftr_count)
 optimizer = torch.optim.SGD(
@@ -144,7 +149,7 @@ def randomize_action(board):
             if my_ship.next_action==ShipAction.CONVERT:
                 current_halite -= board.configuration.convert_cost
         else:
-            my_ship.next_action = choice(SHIP_ACTIONS)
+            my_ship.next_action = choice(SHIP_MOVE_ACTIONS)
             
     for my_shipyard in board.current_player.next_action.shipyards:
         if current_halite > board.configuration.spawn_cost:
@@ -153,8 +158,52 @@ def randomize_action(board):
         else:
             my_shipyard.next_action = None
 
-def model_select_action(board, model):
-    pass
+
+class ExampleCreator:
+    def __init__(self, ftr_count, device):
+        self._example = torch.zeros(ftr_count, dtype=torch.int32, device=device)
+        
+    def create_example(self, board, ship_actions, shipyard_actions):
+        return self._example
+    
+class ActionSelector:
+    def __init__(self, example_creator):
+        self._example_creator = example_creator
+        
+    def model_select_action(self, board, model):
+        action_space = (len(SHIP_ACTIONS)**len(board.current_player.ships)) * (len(SHIPYARD_ACTIONS)**len(board.current_player.shipyards))
+        current_halite = board.current_player.halite
+        ship_actions = np.zeros(len(board.current_player.ships), dtype=np.int32)
+        shipyard_actions = np.zeros(len(board.current_player.ships), dtype=np.int32)
+        if action_space > MAX_ACTION_SPACE:
+            ship_idx = np.random.randn()
+            np.random.randint(len(board.current_player.ships))
+        else:
+            for l in product(range(len(SHIP_ACTIONS)), repeat=len(board.current_player.ships)):
+                ship_halite = current_halite // 2
+                ship_actions.fill(0)
+                shipyard_actions.fill(0)
+                for y in product(range(len(SHIPYARD_ACTIONS)), repeat=len(board.current_player.shipyards)):
+                    shipyard_halite = current_halite // 2
+                    for i, j in enumerate(l):
+                        if SHIP_ACTIONS[j]==ShipAction.CONVERT:
+                            if ship_halite < board.configuration.convert_cost:
+                                j = 0 # set to none action
+                            else:
+                                ship_halite -= board.configuration.convert_cost
+                                
+                        ship_actions[i] = j
+                    for i, j in enumerate(y):
+                        if SHIPYARD_ACTIONS[j]==ShipyardAction.SPAWN:
+                            if shipyard_halite < board.configuration.spawn_cost:
+                                j = 0 # set to none
+                            else
+                                shipyard_halite -= board.configuration.spawn_cost
+                        shipyard_actions[i] = j
+                    example = self._example_creator.create_example(board, ship_actions, shipyard_actions)
+                    q = model(example)       
+                 
+        return
     
 def agent(obs, config):
     board = Board(obs, config)
