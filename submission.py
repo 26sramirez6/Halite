@@ -158,14 +158,147 @@ def randomize_action(board):
         else:
             my_shipyard.next_action = None
 
+def new_position(size, ship, action):
+    ret = ship.position
+    if action==ShipAction.NORTH:
+        if ret.y==size-1:
+            ret = Point(ret.x, 0)
+        else:
+            ret = ret + Point(0,1)
+    elif action==ShipAction.EAST:
+        if ret.x==size-1:
+            ret = Point(0, ret.y)
+        else:
+            ret = ret + Point(1,0)
+    elif action==ShipAction.SOUTH:
+        if ret.y==0:
+            ret = Point(ret.x, size-1)
+        else:
+            ret = ret - Point(1,0)
+    elif action==ShipAction.WEST:
+        if ret.x==0:
+            ret = Point(size-1, ret.y)
+        else:
+            ret = ret - Point(1,0)
+        
+    return ret
 
 class ExampleCreator:
     def __init__(self, ftr_count, device):
         self._example = torch.zeros(ftr_count, dtype=torch.int32, device=device)
         
     def create_example(self, board, ship_actions, shipyard_actions):
+        self._example[:halite_ftr] = board.observation["halite"]
+        current_player = board.current_player
+        for i, my_ship in enumerate(current_player.ships):
+            pos = my_ship.position
+            
+            if ship_actions[i]==0:
+                next_action = None if ship_actions[i]==0 else ShipAction(ship_actions[i])
+            else:
+                next_action = ShipAction(ship_actions[i])
+            next_pos = new_position(BOARD_SIZE, my_ship, next_action)
+            ship_index = (next_pos.y)*BOARD_SIZE + next_pos.x
+            self._example[halite_ftr + ship_index] = 1
+            # reduce the halite farmed by 25% if we didn't move
+            if next_action is None:
+                halite_mined = self._example[:halite_ftr][ship_index] * board.configuration.collect_rate
+                self._example[halite_ftr + my_ship_exist_ftr + ship_index] += halite_mined
+                self._example[:halite_ftr][ship_index] -= halite_mined
+            else:
+                self._example[halite_ftr + my_ship_exist_ftr + ship_index] = my_ship.halite 
+            
+#             ship_halite_cur[0] += my_ship.halite
+        for i, my_shipyard in enumerate(current_player.shipyards):
+            pos = my_shipyard.position
+            next_action = ShipyardAction(shipyard_actions[i])
+            if shipyard_action 
+            shipyard_index = (pos.y)*BOARD_SIZE + pos.x
+            episodes[board.step, halite_ftr + my_ship_exist_ftr + my_ship_halite_ftr + shipyard_index] = 1
+            
+        ftr_index = halite_ftr + my_ship_exist_ftr + my_ship_halite_ftr + my_shipyard_exist_ftr
+        for i, player in enumerate(board.opponents):
+            for enemy_ship in player.ships:
+                pos = enemy_ship.position
+                ship_index = (pos.y)*BOARD_SIZE + pos.x
+                episodes[board.step, ftr_index + ship_index] = 1
+                episodes[board.step, ftr_index + enemy_ship_exist_ftr + ship_index] = enemy_ship.halite
+                ship_halite_cur[i+1] += enemy_ship.halite
+            for enemy_shipyard in player.shipyards:
+                pos = enemy_shipyard.position
+                shipyard_index = (pos.y)*BOARD_SIZE + pos.x
+                episodes[board.step, ftr_index + enemy_ship_exist_ftr + enemy_ship_halite_ftr + shipyard_index] = 1
+        
+        ftr_index += enemy_ship_exist_ftr + enemy_ship_halite_ftr + enemy_shipyard_exist_ftr
+        episodes[board.step, ftr_index] = board.configuration.episode_steps - board.step
+        ftr_index += 1
+        for i, player in enumerate(board.players.values()):
+            episodes[board.step, ftr_index + i] = player.halite
+        ftr_index += halite_deposited_by_player_ftr
+        
+        episodes[board.step, -halite_mined_by_player_ftr:] = np.maximum(player_zeros, ship_halite_cur - ship_halite_prev)
+        ship_halite_prev[:] = ship_halite_cur
+        episode_rewards[board.step] = compute_reward(board)
+        print(board.step)
+        
         return self._example
     
+
+class StateCreator:
+    
+    def step_forward(self, board, ship_actions, shipyard_actions):
+        cp = board.current_player
+        for i, my_ship in enumerate(cp.ships):
+            my_ship.next_action = None if ship_actions[i]==0 else ShipAction(ship_actions[i]) 
+        for i, my_shipyard in enumerate(cp.shipyards):
+            my_shipyard.next_action = None if shipyard_actions[i]==0 else ShipyardAction(ship_actions[i]) 
+        new_board = board.next()
+        return new_board
+    
+    def create_state(self, state, board, ship_actions, shipyard_actions):
+        new_board = self.step_forward(board, ship_actions, shipyard_actions)
+        
+        cp = new_board.current_player
+        state[:halite_ftr] = new_board.observation["halite"]
+        ship_halite_cur.fill(0)
+        
+        for my_ship in cp.ships:
+            pos = my_ship.position
+            ship_index = (pos.y)*BOARD_SIZE + pos.x
+            state[ halite_ftr + ship_index] = 1
+            state[ halite_ftr + my_ship_exist_ftr + ship_index] = my_ship.halite
+            ship_halite_cur[0] += my_ship.halite
+        for my_shipyard in cp.shipyards:
+            pos = my_shipyard.position
+            shipyard_index = (pos.y)*BOARD_SIZE + pos.x
+            state[ halite_ftr + my_ship_exist_ftr + my_ship_halite_ftr + shipyard_index] = 1
+            
+        ftr_index = halite_ftr + my_ship_exist_ftr + my_ship_halite_ftr + my_shipyard_exist_ftr
+        for i, player in enumerate(new_board.opponents):
+            for enemy_ship in player.ships:
+                pos = enemy_ship.position
+                ship_index = (pos.y)*BOARD_SIZE + pos.x
+                state[ ftr_index + ship_index] = 1
+                state[ ftr_index + enemy_ship_exist_ftr + ship_index] = enemy_ship.halite
+                ship_halite_cur[i+1] += enemy_ship.halite
+            for enemy_shipyard in player.shipyards:
+                pos = enemy_shipyard.position
+                shipyard_index = (pos.y)*BOARD_SIZE + pos.x
+                state[ ftr_index + enemy_ship_exist_ftr + enemy_ship_halite_ftr + shipyard_index] = 1
+        
+        ftr_index += enemy_ship_exist_ftr + enemy_ship_halite_ftr + enemy_shipyard_exist_ftr
+        state[ftr_index] = new_board.configuration.episode_steps - new_board.step
+        ftr_index += 1
+        for i, player in enumerate(new_board.players.values()):
+            state[ftr_index + i] = player.halite
+        ftr_index += halite_deposited_by_player_ftr
+        
+        state[-halite_mined_by_player_ftr:] = np.maximum(player_zeros, ship_halite_cur - ship_halite_prev)
+        ship_halite_prev[:] = ship_halite_cur
+        
+        return
+
+        
 class ActionSelector:
     def __init__(self, example_creator):
         self._example_creator = example_creator
@@ -204,6 +337,7 @@ class ActionSelector:
                     q = model(example)       
                  
         return
+
     
 def agent(obs, config):
     board = Board(obs, config)
