@@ -22,6 +22,7 @@ EGREEDY = 0.4
 EGREEDY_DECAY = 0.4
 BATCH_SIZE = 32
 LEARNING_RATE = 0.1
+CHANNELS = 7
 MOMENTUM  = 0.9
 EPOCHS = 3
 MAX_ACTION_SPACE = 1000
@@ -30,31 +31,78 @@ SHIPYARD_ACTIONS = [None, ShipyardAction.SPAWN]
 SHIP_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST,ShipAction.CONVERT]
 SHIP_MOVE_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST]
 
-class Net(nn.Module):
-    def __init__(self, in_features):
-        super(Net, self).__init__()
-        self.l1 = nn.Linear(in_features, 20)
-        self.s1 = nn.Sigmoid()
-        self.l2 = nn.Linear(20, 100)
-        self.s2 = nn.Sigmoid()
-        self.l3 = nn.Linear(100, 100)
-        self.s3 = nn.Sigmoid()
-        self.l4 = nn.Linear(100, 1)
-        nn.init.xavier_uniform(self.l1)
-        nn.init.xavier_uniform(self.l2)
-        nn.init.xavier_uniform(self.l3)
-        nn.init.xavier_uniform(self.l4)
+class DQN(nn.Module):
+    def __init__(self, conv_layers, fc_layers, fc_volume, filters, kernel, stride, pad, ts_ftrs):
+        super(DQN, self).__init__()
         
-    def forward(self, x):
-        y = self.l1(x)
-        y = self.s1(y)
+        self._conv_layers = []
+        self._relus = []
         
-        y = self.l2(y)
-        y = self.s2(y)
+        for i in range(conv_layers):
+            layer = nn.Conv2d(
+                CHANNELS if i==0 else filters,   # number of in channels (depth of input)
+                filters,    # out channels (depth, or number of filters)
+                kernel,     # size of convolving kernel
+                stride,     # stride of kernel
+                pad)        # padding
+            nn.init.xavier_uniform(layer.weight)
+            relu = nn.ReLU()
+            
+            self._conv_layers.append(layer)
+            self._relus.append(relu)
+            # necessary to register layer
+            setattr(self, "_conv{0}".format(i), layer)
+            setattr(self, "_relu{0}".format(i), relu)
+            
+        volume = DQN._compute_output_dim(BOARD_SIZE, kernel, stride, pad)
+        self._fc_layers = []
+        self._sigmoids = []
+        for i in range(fc_layers):
+            layer = nn.Linear(
+                (volume * volume * filters + ts_ftrs) if i==0 else fc_volume, # number of neurons from previous layer
+                fc_volume # number of neurons in output layer
+                )
+            nn.init.xavier_uniform(layer.weight)
+            sigmoid = nn.Sigmoid()
+            self._sigmoids.append(sigmoid)
+            
+            # necessary to register layer
+            setattr(self, "_fc{0}".format(i), layer)
+            setattr(self, "_sigmoid{0}".format(i), sigmoid)
+            
+        self._final_layer = nn.Linear(
+                fc_volume,
+                1)
         
-        y = self.l3(y)
-        y = self.s3(y)
-        return self.l4(y)
+    def forward(self, geometric_x, ts_x):
+        y = self._conv_layers[0](geometric_x)
+        y = self._relus[0](y)
+        for layer, activation in zip(self._conv_layers[1:], self._relus[1:]):
+            y = layer(y)
+            y = activation(y)
+        
+        y = y.view(-1)
+        y = torch.cat((y, ts_x), dim=0)
+        for layer, activation in zip(self._fc_layers, self._sigmoids):
+            y = layer(y)
+            y = activation(y)
+        
+        return self._final_layer(y)
+    
+    @staticmethod
+    def _compute_output_dim(w, f, s, p):
+        for el in [w,f,s,p]:
+            DQN._check_and_convert(el)
+            if not isinstance(el, int):
+                raise ValueError()
+        ret = (w-f+2*p)/s + 1
+        return DQN._check_and_convert(ret)
+    
+    @staticmethod
+    def _check_and_convert(f):
+        if not float(f).is_integer():
+            raise ValueError("error on {0}".format(f))
+        return int(f)
 
 
 halite_ftr = BOARD_SIZE**2
@@ -80,11 +128,26 @@ ftr_count = (
     halite_deposited_by_player_ftr +
     halite_mined_by_player_ftr)
 
+ts_ftr_count = (
+    turns_remaining_ftr +
+    halite_deposited_by_player_ftr +
+    halite_mined_by_player_ftr)
+
+geometric_ftr_count = (
+    halite_ftr + 
+    my_ship_exist_ftr + 
+    my_ship_halite_ftr + 
+    my_shipyard_exist_ftr +
+    enemy_ship_exist_ftr + 
+    enemy_ship_halite_ftr + 
+    enemy_shipyard_exist_ftr)
+
 game_step = 0
-episodes = np.zeros((EPISODE_STEPS, ftr_count))
-episode_rewards = np.zeros(EPISODE_STEPS)
-halite_mined = np.zeros(PLAYERS)
-    
+geometric_ftrs = torch.zeros((EPISODE_STEPS, CHANNELS, BOARD_SIZE, BOARD_SIZE), dtype=torch.float)
+time_series_ftrs = torch.zeros((EPISODE_STEPS, ts_ftr_count), dtype=torch.float)
+episode_rewards = torch.zeros(EPISODE_STEPS, dtype=torch.float)
+
+halite_mined = np.zeros(PLAYERS)    
 ship_halite_prev = np.zeros(PLAYERS)
 ship_halite_cur = np.zeros(PLAYERS)
 player_zeros = np.zeros(PLAYERS)
@@ -94,14 +157,31 @@ halite_lost = 0
 halite_stolen = 0
 
 # criterion = nn.CrossEntropyLoss()
-criterion = nn.SmoothL1Loss()
+criterion = nn.SmoothL1Loss() # huber
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-net = Net(ftr_count)
+net = DQN(
+    10, # number of conv layers
+    2,  # number of fully connected layers at end
+    32, # number of neurons in fully connected layers at end
+    2,  # number of filters for conv layers (depth)
+    5,  # size of kernel
+    1,  # stride of the kernel
+    0,  # padding
+    3)  # number of extra time series features
+
 optimizer = torch.optim.SGD(
-    model.parameters(), 
-    lr=LEARNING_RATE, momentum=MOMENTUM, 
+    net.parameters(), 
+    lr=LEARNING_RATE, 
+    momentum=MOMENTUM, 
     weight_decay=WEIGHT_DECAY)
 
+
+class Features:
+    def __init__(self, board_size):
+        self.geometric = torch.zeros((3, board_size, board_size), dtype=torch.float)
+        self.time_series = torch.zeros((), dtype=torch.float)
+        
+        
 class ModelPropagator:
     def __init__(self, board_size, player_count):
         self._state = np.zeros(ftr_count)
@@ -289,7 +369,41 @@ def step_forward(board, ship_actions, shipyard_actions):
     new_board = board.next()
     return new_board
 
-def update_state(state, board, ship_halite_cur, ship_halite_prev):        
+def update_tensors(geometric_tensor, ts_tensor, board, ship_halite_cur, ship_halite_prev):        
+    cp = board.current_player
+    ship_halite_cur.fill(0)
+    # there doesn't seem to be a good way to assign a list/array to an existing tensor
+    for i in range(BOARD_SIZE):
+        for j in range(BOARD_SIZE):
+            geometric_tensor[0, i, j] = board.observation["halite"][i * BOARD_SIZE + j]
+                
+    for my_ship in cp.ships:
+        geometric_tensor[1, my_ship.position.x, my_ship.position.y] = 1
+        geometric_tensor[2, my_ship.position.x, my_ship.position.y] = my_ship.halite
+        ship_halite_cur[0] += my_ship.halite
+    for my_shipyard in cp.shipyards:
+        geometric_tensor[3, my_shipyard.position.x, my_shipyard.position.y] = 1
+    
+    for i, player in enumerate(board.opponents):
+        for enemy_ship in player.ships:
+            geometric_tensor[4, enemy_ship.position.x, enemy_ship.position.y] = 1
+            geometric_tensor[5, enemy_ship.position.x, enemy_ship.position.y] = enemy_ship.halite
+        for enemy_shipyard in player.shipyards:
+            geometric_tensor[6, enemy_shipyard.position.x, enemy_shipyard.position.y] = 1
+    
+    ts_tensor[0] = board.configuration.episode_steps - board.step
+#     for i, player in enumerate(board.players.values()):
+#         state[ftr_index + i] = player.halite
+#     min_max_norm(state[ftr_index: ftr_index+halite_deposited_by_player_ftr])
+#     ftr_index += halite_deposited_by_player_ftr
+#     
+#     # should we also min_max_norm the amount of halite mined?
+#     state[-halite_mined_by_player_ftr:] = np.maximum(player_zeros, ship_halite_cur - ship_halite_prev)
+#     min_max_norm(state[-halite_mined_by_player_ftr:])
+    
+    return
+
+def update_state_old(state, board, ship_halite_cur, ship_halite_prev):        
     cp = board.current_player
     state[:halite_ftr] = board.observation["halite"]
     ship_halite_cur.fill(0)
@@ -339,9 +453,9 @@ def update_state(state, board, ship_halite_cur, ship_halite_prev):
     
 def agent(obs, config):
     board = Board(obs, config)
-    update_state(episodes[board.step], board, ship_halite_cur, ship_halite_prev)
-    ship_halite_prev[:] = ship_halite_cur
-    mp.set_ship_halite_prev(ship_halite_cur)
+    update_tensor(geometric_states[board.step], board)
+#     ship_halite_prev[:] = ship_halite_cur
+#     mp.set_ship_halite_prev(ship_halite_cur)
     episode_rewards[board.step] = compute_reward(board)
     print(board.step, episode_rewards[board.step])
     
