@@ -3,19 +3,19 @@ Created on Jul 26, 2020
 
 @author: 26sra
 '''
-from kaggle_environments.envs.halite.helpers import * #@UnusedWildImport
-from kaggle_environments import make #@UnusedImport
-from random import choice #@UnusedImport
-
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F #@UnusedImport
 from itertools import permutations, product #@UnusedImport
+from kaggle_environments.envs.halite.helpers import * #@UnusedWildImport
+from kaggle_environments import make #@UnusedImport
+from random import choice #@UnusedImport
 
 EPISODE_STEPS = 200
 STARTING = 1000
-BOARD_SIZE = 10
+BOARD_SIZE = 21
 PLAYERS = 2
 GAMMA = 0.9
 EGREEDY = 0.4
@@ -47,7 +47,7 @@ class DQN(nn.Module):
                 kernel,     # size of convolving kernel
                 stride,     # stride of kernel
                 pad)        # padding
-            nn.init.xavier_uniform(layer.weight)
+            nn.init.xavier_uniform_(layer.weight)
             relu = nn.ReLU()
             
             self._conv_layers.append(layer)
@@ -64,7 +64,7 @@ class DQN(nn.Module):
                 (volume * volume * filters + ts_ftrs) if i==0 else fc_volume, # number of neurons from previous layer
                 fc_volume # number of neurons in output layer
                 )
-            nn.init.xavier_uniform(layer.weight)
+            nn.init.xavier_uniform_(layer.weight)
             sigmoid = nn.Sigmoid()
             self._sigmoids.append(sigmoid)
             
@@ -79,8 +79,10 @@ class DQN(nn.Module):
     def forward(self, geometric_x, ts_x):
         y = self._conv_layers[0](geometric_x)
         y = self._relus[0](y)
-        for layer, activation in zip(self._conv_layers[1:], self._relus[1:]):
+        print(y.size(), file=sys.__stdout__)
+        for layer, activation in zip(self._conv_layers[1:], self._relus[1:]):            
             y = layer(y)
+            print(y.size(), file=sys.__stdout__)
             y = activation(y)
         
         y = y.view(-1)
@@ -106,11 +108,11 @@ class DQN(nn.Module):
             raise ValueError("error on {0}".format(f))
         return int(f)
 
-game_step = 0
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu") #@UndefinedVariable
 geometric_ftrs = torch.zeros((EPISODE_STEPS, CHANNELS, BOARD_SIZE, BOARD_SIZE), dtype=torch.float).to(device) #@UndefinedVariable
 time_series_ftrs = torch.zeros((EPISODE_STEPS, TS_FTR_COUNT), dtype=torch.float).to(device) #@UndefinedVariable
 episode_rewards = torch.zeros(EPISODE_STEPS, dtype=torch.float).to(device) #@UndefinedVariable
+q_values = torch.zeros(EPISODE_STEPS, dtype=torch.float).to(device) #@UndefinedVariable
 ship_halite_cur = torch.zeros(PLAYERS, dtype=torch.float).to(device) #@UndefinedVariable
 ship_halite_prev = torch.zeros(PLAYERS, dtype=torch.float).to(device) #@UndefinedVariable
 player_zeros = torch.zeros(PLAYERS, dtype=torch.float).to(device) #@UndefinedVariable
@@ -127,7 +129,7 @@ dqn = DQN(
     2,  # number of fully connected layers at end
     32, # number of neurons in fully connected layers at end
     2,  # number of filters for conv layers (depth)
-    5,  # size of kernel
+    3,  # size of kernel
     1,  # stride of the kernel
     0,  # padding
     TS_FTR_COUNT# number of extra time series features
@@ -149,7 +151,7 @@ def randomize_action(board):
         else:
             my_ship.next_action = choice(SHIP_MOVE_ACTIONS)
             
-    for my_shipyard in board.current_player.next_action.shipyards:
+    for my_shipyard in board.current_player.shipyards:
         if current_halite > board.configuration.spawn_cost:
             my_shipyard.next_action = choice(SHIPYARD_ACTIONS)
             current_halite -= board.configuration.spawn_cost
@@ -198,7 +200,7 @@ def step_forward(board, ship_actions, shipyard_actions):
 
 def update_tensors(geometric_tensor, ts_tensor, board, ship_halite_cur, ship_halite_prev):        
     cp = board.current_player
-    ship_halite_cur.fill(0)
+    ship_halite_cur.fill_(0)
     # there doesn't seem to be a good way to assign a list/array to an existing tensor
     for i in range(BOARD_SIZE):
         for j in range(BOARD_SIZE):
@@ -231,11 +233,11 @@ def update_tensors(geometric_tensor, ts_tensor, board, ship_halite_cur, ship_hal
 
 class BoardEmulator:
     def __init__(self):
-        self._geometric_ftrs = torch.zeros((CHANNELS, BOARD_SIZE, BOARD_SIZE), dtype=torch.float) #@UndefinedVariable
-        self._ts_ftrs = torch.zeros(TS_FTR_COUNT, dtype=torch.float) #@UndefinedVariable
+        self._geometric_ftrs = torch.zeros((1, CHANNELS, BOARD_SIZE, BOARD_SIZE), dtype=torch.float).to(device) #@UndefinedVariable
+        self._ts_ftrs = torch.zeros((1,TS_FTR_COUNT), dtype=torch.float).to(device) #@UndefinedVariable
         
-        self._ship_halite_prev = torch.zeros(PLAYERS, dtype=torch.float) #@UndefinedVariable
-        self._ship_halite_cur = torch.zeros(PLAYERS, dtype=torch.float) #@UndefinedVariable
+        self._ship_halite_prev = torch.zeros(PLAYERS, dtype=torch.float).to(device) #@UndefinedVariable
+        self._ship_halite_cur = torch.zeros(PLAYERS, dtype=torch.float).to(device) #@UndefinedVariable
         
         # assume a max amount of ships and shipyards to
         # so we can allocate upfront
@@ -268,8 +270,9 @@ class BoardEmulator:
                     self._ship_actions[i] = j
                 
                     new_board = step_forward(board, self._ship_actions, self._shipyard_actions)
-                    update_tensors(self._geometric_ftrs, self._ts_ftrs, new_board, self._ship_halite_cur, self._ship_halite_prev)
-                    q_value = model(self._state)
+                    update_tensors(self._geometric_ftrs[0], self._ts_ftrs[0], new_board, self._ship_halite_cur, self._ship_halite_prev)
+                    with torch.no_grad():
+                        q_value = model(self._geometric_ftrs, self._ts_ftrs)
                     if q_value > max_q_value:
                         max_q_value = q_value
                         self._best_ship_actions[:ship_count] = self._ship_actions[:ship_count]
@@ -282,8 +285,9 @@ class BoardEmulator:
                     self._shipyard_actions[i] = j
                 
                     new_board = step_forward(board, self._ship_actions, self._shipyard_actions)
-                    update_tensors(self._geometric_ftrs, self._ts_ftrs, new_board, self._ship_halite_cur, self._ship_halite_prev)
-                    q_value = model(self._state)
+                    update_tensors(self._geometric_ftrs[0], self._ts_ftrs[0], new_board, self._ship_halite_cur, self._ship_halite_prev)
+                    with torch.no_grad():
+                        q_value = model(self._geometric_ftrs, self._ts_ftrs)
                     if q_value > max_q_value:
                         max_q_value = q_value
                         self._best_ship_actions[:ship_count] = self._ship_actions[:ship_count]
@@ -313,8 +317,9 @@ class BoardEmulator:
                         self._shipyard_actions[i] = j
                     
                     new_board = step_forward(board, self._ship_actions, self._shipyard_actions)
-                    update_tensors(self._geometric_ftrs, self._ts_ftrs, new_board, self._ship_halite_cur, self._ship_halite_prev)
-                    q_value = model(self._state)
+                    update_tensors(self._geometric_ftrs[0], self._ts_ftrs[0], new_board, self._ship_halite_cur, self._ship_halite_prev)
+                    with torch.no_grad():
+                        q_value = model(self._geometric_ftrs, self._ts_ftrs)
                     if q_value > max_q_value:
                         max_q_value = q_value
                         self._best_ship_actions[:ship_count] = self._ship_actions[:ship_count]
@@ -331,8 +336,8 @@ def train(model, geometric_sample, ts_samples, q_values, optimizer, epoch, crite
     loss.backward()
     optimizer.step()
         
-mined_reward_weights = torch.tensor([2] + [-1]*(PLAYERS-1), dtype=float)
-deposited_reward_weights = torch.tensor([10] + [-1]*(PLAYERS-1), dtype=float)
+mined_reward_weights = torch.tensor([2] + [-1]*(PLAYERS-1), dtype=torch.float).to(device) #@UndefinedVariable
+deposited_reward_weights = torch.tensor([10] + [-1]*(PLAYERS-1), dtype=torch.float).to(device) #@UndefinedVariable
 def compute_reward(board):
     if board.step==0: return -100
         
@@ -354,23 +359,13 @@ def compute_reward(board):
     
     return reward
 
-emulator = BoardEmulator(PLAYERS)
+emulator = BoardEmulator()
 def agent(obs, config):
     board = Board(obs, config)
     update_tensors(geometric_ftrs[board.step], time_series_ftrs[board.step], board, ship_halite_cur, ship_halite_prev)
     ship_halite_prev[:] = ship_halite_cur
     emulator.set_ship_halite_prev(ship_halite_cur)
     episode_rewards[board.step] = compute_reward(board)
-    idxs = np.random.randint(0, board.step, BATCH_SIZE)
-    if board.step % SAMPLE_CYCLE == 0:
-        train(dqn, 
-              device, 
-              geometric_ftrs[idxs], 
-              time_series_ftrs[idxs], 
-              q_values[idxs], 
-              optimizer, 
-              0, 
-              huber)
         
     print(board.step, episode_rewards[board.step])
     
@@ -378,14 +373,21 @@ def agent(obs, config):
         randomize_action(board)
     else:
         emulator.select_action(board, dqn)
-        
     return board.current_player.next_actions
+
+gamma_vec = torch.tensor([GAMMA**i for i in range(EPISODE_STEPS)], dtype=torch.float).to(device) #@UndefinedVariable
+gamma_mat = torch.zeros((EPISODE_STEPS, EPISODE_STEPS), dtype=torch.float).to(device) #@UndefinedVariable
+for i in range(EPISODE_STEPS):
+    gamma_mat[i, i:] = gamma_vec[:EPISODE_STEPS-i]
+def compute_q_post_game():
+    torch.matmul(gamma_mat, episode_rewards, out=q_values) #@UndefinedVariable
     
 env = make("halite", configuration={"size": BOARD_SIZE, "startingHalite": STARTING, "episodeSteps": EPISODE_STEPS})
 env.reset(PLAYERS)
 print("starting")
 env.run([agent, "random"])
 print("complete")
+compute_q_post_game()
 
 out = env.render(mode="html", width=800, height=600)
 with open("test.html", "w") as f:
