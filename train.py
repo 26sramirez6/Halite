@@ -21,9 +21,10 @@ EPISODE_STEPS = 50
 STARTING = 5000
 BOARD_SIZE = 21
 PLAYERS = 4
-GAMMA = 0.5
+GAMMA = 0.9
 EGREEDY = 1
 EGREEDY_DECAY = 0.0005
+EGREEDY_LOWER_BOUND = 0.2
 GAME_BATCH_SIZE = 4
 TRAIN_BATCH_SIZE = 512
 LEARNING_RATE = 0.1
@@ -84,10 +85,13 @@ class AgentStateManager:
         self.emulator.set_prior_ship_cargo(prior_ship_cargo)
     
     def compute_q_post_game(self):
-        torch.matmul(
-            self.gamma_mat[:self.in_game_episodes_seen, :self.in_game_episodes_seen], 
-            self.episode_rewards[self.total_episodes_seen: self.total_episodes_seen + self.in_game_episodes_seen], 
-            out=self.q_values[self.total_episodes_seen: self.total_episodes_seen + self.in_game_episodes_seen]) #@UndefinedVariable
+        try:
+            torch.matmul(
+                self.gamma_mat[:self.in_game_episodes_seen, :self.in_game_episodes_seen], 
+                self.episode_rewards[self.total_episodes_seen: self.total_episodes_seen + self.in_game_episodes_seen], 
+                out=self.q_values[self.total_episodes_seen: self.total_episodes_seen + self.in_game_episodes_seen]) #@UndefinedVariable
+        except Exception as e:
+            raise e
         
     def serialize(self):
         append = 'p{0}g{1}_{2}'.format(self.player_id, self.game_id, TIMESTAMP)
@@ -208,6 +212,8 @@ dqn = DQN(
     0,  # padding
     TS_FTR_COUNT# number of extra time series features
     ).to(device)  
+    
+# dqn.load_state_dict(torch.load("{0}/dqn_{0}.nn".format(TIMESTAMP)))
 
 optimizer = torch.optim.SGD( #@UndefinedVariable
     dqn.parameters(), 
@@ -470,41 +476,41 @@ class BoardEmulator:
     
 def train(model, criterion, agent_managers):
     model.train()
-    for asm in agent_managers.values():
-        idxs = list(range(asm.total_episodes_seen))
-        np.random.shuffle(idxs)
-        for j, i in enumerate(range(0, len(idxs), TRAIN_BATCH_SIZE)):
-            train_idx = idxs[i:i+TRAIN_BATCH_SIZE]
-            y_pred = model(
-                asm.geometric_ftrs[train_idx], 
-                asm.time_series_ftrs[train_idx])
-            loss = criterion(y_pred.view(-1), asm.q_values[train_idx])
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            print("Train batch iteration: {}, Loss: {}".format(j, loss.item()))
-        model.trained_examples += len(idxs)    
+    for e in range(EPOCHS):
+        for asm in agent_managers.values():
+            idxs = list(range(asm.total_episodes_seen))
+            np.random.shuffle(idxs)
+            for j, i in enumerate(range(0, len(idxs), TRAIN_BATCH_SIZE)):
+                train_idx = idxs[i:i+TRAIN_BATCH_SIZE]
+                y_pred = model(
+                    asm.geometric_ftrs[train_idx], 
+                    asm.time_series_ftrs[train_idx])
+                loss = criterion(y_pred.view(-1), asm.q_values[train_idx])
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                print("Epoch: {}, Train batch iteration: {}, Loss: {}".format(e, j, loss.item()))
+            model.trained_examples += len(idxs)    
     torch.save(model.state_dict(), "{0}/dqn_{0}.nn".format(TIMESTAMP))
         
-mined_reward_weights = torch.tensor([100] + [-.25]*(PLAYERS-1), dtype=torch.float).to(device) #@UndefinedVariable
-deposited_reward_weights = torch.tensor([10] + [-.1]*(PLAYERS-1), dtype=torch.float).to(device) #@UndefinedVariable
+mined_reward_weights = torch.tensor([1] + [-.25]*(PLAYERS-1), dtype=torch.float).to(device) #@UndefinedVariable
+# deposited_reward_weights = torch.tensor([1] + [-.1]*(PLAYERS-1), dtype=torch.float).to(device) #@UndefinedVariable
 def compute_reward(
         current_board, 
         prior_board, 
         current_mined_halite,
         current_deposited_halite, 
         prior_deposited_halite):
-    if current_board.step==0: return -100
+    if current_board.step==0: return 0
         
     halite_cargo_reward = (current_mined_halite * 
                            mined_reward_weights).sum().item()
     
-    halite_deposited_reward = (
-        torch.max(player_zeros,
-        (current_deposited_halite - prior_deposited_halite))*
-    deposited_reward_weights).sum().item()
-        
+    halite_deposited_score_diff = (max(current_deposited_halite) - current_deposited_halite[0]).item()
+    
+    halite_deposited_reward = max(0,(current_deposited_halite[0] - prior_deposited_halite[0]).item())
+    
     prior_ships_set = set([ship.id for ship in prior_board.current_player.ships])
     current_ships_set = set([ship.id for ship in current_board.current_player.ships])
     prior_shipyards_set = set([shipyard.id for shipyard in prior_board.current_player.shipyards])
@@ -513,11 +519,11 @@ def compute_reward(
     my_ships_lost_from_collision = len(prior_ships_set.difference(current_ships_set))
     my_shipyards_lost_from_collision = len(prior_shipyards_set.difference(current_shipyards_set))
     
-    reward = (halite_deposited_reward +
-              halite_cargo_reward + 
-              my_ships_lost_from_collision*-5000 +
-              my_shipyards_lost_from_collision*-200 + 
-              100)
+    reward = (halite_deposited_score_diff*-1 +
+              halite_deposited_reward*1 +
+              halite_cargo_reward*1 + 
+              my_ships_lost_from_collision*-500 +
+              my_shipyards_lost_from_collision*-500)
     
     return reward
 
@@ -553,7 +559,7 @@ def agent(obs, config):
 #           reward, 
 #           file=sys.__stdout__)
     
-    epsilon = EGREEDY*((1-EGREEDY_DECAY)**dqn.trained_examples)
+    epsilon = max(EGREEDY_LOWER_BOUND, EGREEDY*((1-EGREEDY_DECAY)**dqn.trained_examples))
     randomize = np.random.rand() < epsilon
 #     print("epsilon: ", epsilon, "randomize: ", randomize)
     if randomize:
@@ -596,15 +602,17 @@ agents = [agent, agent, swarm_agent, "random"]
 while i < GAME_COUNT:
     env.reset(PLAYERS)
     np.random.shuffle(agents)
+    active_agents = set([j for j, el in enumerate(agents) if el==agent])
     print("starting game {0} with agent order: {1}".format(i, agents))
-    
+    active_agent_managers = {j:asm for j,asm in agent_managers.items() if j in active_agents}
     steps = env.run(agents)
     print("completed game {0}".format(i))
-    for asm in agent_managers.values():
+    
+    for asm in active_agent_managers.values():
         asm.compute_q_post_game()
     
     if OUTPUT_LOGS:
-        output_logs(env, steps, agent_managers)
+        output_logs(env, steps, active_agent_managers)
         print("outputted data files")
         
     for asm in agent_managers.values():
