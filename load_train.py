@@ -18,21 +18,20 @@ from kaggle_environments.envs.halite.helpers import * #@UnusedWildImport
 from kaggle_environments import make #@UnusedImport
 from random import choice #@UnusedImport
 
-MAX_EPISODES_MEMORY = 512
+MAX_EPISODES_MEMORY = 2**20
 EPISODE_STEPS = 400
 BOARD_SIZE = 21
 PLAYERS = 4
-GAME_BATCH_SIZE = 8
-TRAIN_BATCH_SIZE = 1024
-GAME_POOL_SIZE = 16
-LEARNING_RATE = 0.1
+GAME_BATCH_SIZE = 4
+TRAIN_BATCH_SIZE = 2048
+LEARNING_RATE = 0.01
 CHANNELS = 7
 MOMENTUM  = 0.9
-EPOCHS = 8
+EPOCHS = 64 
 WEIGHT_DECAY = 5e-4
 TS_FTR_COUNT = 1 + PLAYERS*2 
-GAME_COUNT = 10000
-TIMESTAMP = "2020_08_11_09.34.59.899412"
+GAME_COUNT = 1000
+TIMESTAMP = "2020_08_10_23.16.21.365570"
 
 
 class DQN(nn.Module):
@@ -124,7 +123,7 @@ dqn = DQN(
     0,  # padding
     TS_FTR_COUNT# number of extra time series features
     ).to(device)  
-dqn.load_state_dict(torch.load("{0}/dqn_{0}.nn".format(TIMESTAMP)))
+dqn.load_state_dict(torch.load("{0}/dqn_e7_{0}.nn".format(TIMESTAMP)))
 
 optimizer = torch.optim.SGD( #@UndefinedVariable
     dqn.parameters(), 
@@ -196,6 +195,7 @@ def main():
         ds.q = torch.cat((ds.q, q))
         
         ds.episodes_loaded += q.shape[0]
+        print("loaded {0} episodes".format(q.shape[0]))
         
     if ds.episodes_loaded > 0:
         train(dqn, huber, ds)
