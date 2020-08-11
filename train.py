@@ -17,29 +17,29 @@ from kaggle_environments.envs.halite.helpers import * #@UnusedWildImport
 from kaggle_environments import make #@UnusedImport
 from random import choice #@UnusedImport
 
-EPISODE_STEPS = 50
+EPISODE_STEPS = 400
 STARTING = 5000
 BOARD_SIZE = 21
 PLAYERS = 4
 GAMMA = 0.9
 EGREEDY = 1
-EGREEDY_DECAY = 0.0005
+EGREEDY_DECAY = 0.00001
 EGREEDY_LOWER_BOUND = 0.2
 GAME_BATCH_SIZE = 4
 TRAIN_BATCH_SIZE = 512
-LEARNING_RATE = 0.1
+LEARNING_RATE = 0.01
 CHANNELS = 7
 MOMENTUM  = 0.9
 SAMPLE_CYCLE = 10
 OUTPUT_LOGS = True
-EPOCHS = 3
-MAX_ACTION_SPACE = 500
+EPOCHS = 8
+MAX_ACTION_SPACE = 200
 WEIGHT_DECAY = 5e-4
 SHIPYARD_ACTIONS = [None, ShipyardAction.SPAWN]
 SHIP_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST,ShipAction.CONVERT]
 SHIP_MOVE_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST]
 TS_FTR_COUNT = 1 + PLAYERS*2 
-GAME_COUNT = 10000
+GAME_COUNT = 1000
 TIMESTAMP = str(datetime.datetime.now()).replace(' ', '_').replace(':', '.').replace('-',"_")
     
 class AgentStateManager:
@@ -491,7 +491,8 @@ def train(model, criterion, agent_managers):
                 optimizer.step()
                 
                 print("Epoch: {}, Train batch iteration: {}, Loss: {}".format(e, j, loss.item()))
-            model.trained_examples += len(idxs)    
+            if e==0:
+                model.trained_examples += len(idxs)    
     torch.save(model.state_dict(), "{0}/dqn_{0}.nn".format(TIMESTAMP))
         
 mined_reward_weights = torch.tensor([1] + [-.25]*(PLAYERS-1), dtype=torch.float).to(device) #@UndefinedVariable
@@ -527,12 +528,9 @@ def compute_reward(
     
     return reward
 
-agent_managers = {}
 def agent(obs, config):
     global agent_managers
     current_board = Board(obs, config)
-    if current_board.current_player.id not in agent_managers:
-        agent_managers[current_board.current_player.id] = AgentStateManager(current_board.current_player.id)
     
     asm = agent_managers.get(current_board.current_player.id)
     ftr_index = asm.total_episodes_seen + asm.in_game_episodes_seen
@@ -599,12 +597,15 @@ print(env.configuration)
 i = 1
 from Halite_Swarm_Intelligence import swarm_agent
 agents = [agent, agent, swarm_agent, "random"]
+agent_managers = {i: AgentStateManager(i) for i in range(4)}
+    
 while i < GAME_COUNT:
     env.reset(PLAYERS)
     np.random.shuffle(agents)
     active_agents = set([j for j, el in enumerate(agents) if el==agent])
     print("starting game {0} with agent order: {1}".format(i, agents))
     active_agent_managers = {j:asm for j,asm in agent_managers.items() if j in active_agents}
+    
     steps = env.run(agents)
     print("completed game {0}".format(i))
     
