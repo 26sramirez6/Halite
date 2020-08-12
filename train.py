@@ -4,7 +4,7 @@ Created on Jul 26, 2020
 @author: 26sra
 '''
 import sys #@UnusedImport
-import numpy as np
+import numpy as np 
 import torch
 import os
 import time
@@ -21,12 +21,12 @@ EPISODE_STEPS = 400
 STARTING = 5000
 BOARD_SIZE = 21
 PLAYERS = 4
-GAMMA = 0.9
+GAMMA = 0.7
 EGREEDY = 1
-EGREEDY_DECAY = 0.00001
-EGREEDY_LOWER_BOUND = 0.2
+EGREEDY_DECAY = 0.00005
+EGREEDY_LOWER_BOUND = .1
 GAME_BATCH_SIZE = 4
-TRAIN_BATCH_SIZE = 512
+TRAIN_BATCH_SIZE = 32
 LEARNING_RATE = 0.01
 CHANNELS = 7
 MOMENTUM  = 0.9
@@ -41,7 +41,12 @@ SHIP_MOVE_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,Shi
 TS_FTR_COUNT = 1 + PLAYERS*2 
 GAME_COUNT = 1000
 TIMESTAMP = str(datetime.datetime.now()).replace(' ', '_').replace(':', '.').replace('-',"_")
-    
+RANDOM_SEED = -1; 
+if RANDOM_SEED > -1: 
+    np.random.seed(RANDOM_SEED)
+    torch.manual_seed(RANDOM_SEED)
+
+
 class AgentStateManager:
     @classmethod
     def init_gamma_mat(cls, device):
@@ -85,13 +90,10 @@ class AgentStateManager:
         self.emulator.set_prior_ship_cargo(prior_ship_cargo)
     
     def compute_q_post_game(self):
-        try:
             torch.matmul(
                 self.gamma_mat[:self.in_game_episodes_seen, :self.in_game_episodes_seen], 
                 self.episode_rewards[self.total_episodes_seen: self.total_episodes_seen + self.in_game_episodes_seen], 
                 out=self.q_values[self.total_episodes_seen: self.total_episodes_seen + self.in_game_episodes_seen]) #@UndefinedVariable
-        except Exception as e:
-            raise e
         
     def serialize(self):
         append = 'p{0}g{1}_{2}'.format(self.player_id, self.game_id, TIMESTAMP)
@@ -127,9 +129,11 @@ class DQN(nn.Module):
         self.trained_examples = 0
         height = DQN._compute_output_dim(BOARD_SIZE, kernel, stride, pad)
         for i in range(conv_layers):
+            channels_in = CHANNELS if i==0 else filters * (2**(i-1))
+            channels_out = filters * (2**i)
             layer = nn.Conv2d(
-                CHANNELS if i==0 else filters,   # number of in channels (depth of input)
-                filters,    # out channels (depth, or number of filters)
+                channels_in,   # number of in channels (depth of input)
+                channels_out,    # out channels (depth, or number of filters)
                 kernel,     # size of convolving kernel
                 stride,     # stride of kernel
                 pad)        # padding
@@ -149,7 +153,7 @@ class DQN(nn.Module):
         self._sigmoids = []
         for i in range(fc_layers):
             layer = nn.Linear(
-                (height * height * filters + ts_ftrs) if i==0 else fc_volume, # number of neurons from previous layer
+                (height * height * channels_out + ts_ftrs) if i==0 else fc_volume, # number of neurons from previous layer
                 fc_volume # number of neurons in output layer
                 )
             nn.init.xavier_uniform_(layer.weight)
@@ -198,15 +202,12 @@ class DQN(nn.Module):
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu") #@UndefinedVariable
 player_zeros = torch.zeros(PLAYERS, dtype=torch.float).to(device) #@UndefinedVariable
-halite_lost_from_collision = 0
-halite_stolen_from_collision = 0
-# criterion = nn.CrossEntropyLoss()
 huber = nn.SmoothL1Loss()
 dqn = DQN(
-    10, # number of conv layers
+    4, # number of conv layers
     2,  # number of fully connected layers at end
-    32, # number of neurons in fully connected layers at end
-    8,  # number of filters for conv layers (depth)
+    64, # number of neurons in fully connected layers at end
+    8,  # number of start filters for conv layers (depth)
     3,  # size of kernel
     1,  # stride of the kernel
     0,  # padding
@@ -451,6 +452,12 @@ class BoardEmulator:
                     
             self._shipyard_actions[0,i] = self._best_shipyard_actions[i]
     
+    def get_action_space(self, board):
+        ship_count = len(board.current_player.ships)
+        shipyard_count = len(board.current_player.shipyards)
+        action_space = (len(SHIP_ACTIONS)**ship_count) * (len(SHIPYARD_ACTIONS)**shipyard_count)
+        return action_space
+    
     def select_action(self, board, model):
         model.eval()
         ship_count = len(board.current_player.ships)
@@ -520,11 +527,16 @@ def compute_reward(
     my_ships_lost_from_collision = len(prior_ships_set.difference(current_ships_set))
     my_shipyards_lost_from_collision = len(prior_shipyards_set.difference(current_shipyards_set))
     
+    my_ships_built = len(current_ships_set.difference(prior_ships_set))
+    my_shipyards_built = len(current_shipyards_set.difference(prior_shipyards_set))
+    
     reward = (halite_deposited_score_diff*-1 +
               halite_deposited_reward*1 +
               halite_cargo_reward*1 + 
-              my_ships_lost_from_collision*-500 +
-              my_shipyards_lost_from_collision*-500)
+              my_ships_lost_from_collision*-750 +
+              my_shipyards_lost_from_collision*-750 +
+              my_ships_built*500 +
+              my_shipyards_built*500)
     
     return reward
 
@@ -551,15 +563,21 @@ def agent(obs, config):
         None if current_board.step==0 else asm.time_series_ftrs[ftr_index-1, 1:  1 + PLAYERS])
     
     asm.episode_rewards[ftr_index] = reward
-#     print("board step:", 
-#           current_board.step, 
-#           ", reward:", 
-#           reward, 
-#           file=sys.__stdout__)
     
     epsilon = max(EGREEDY_LOWER_BOUND, EGREEDY*((1-EGREEDY_DECAY)**dqn.trained_examples))
     randomize = np.random.rand() < epsilon
-#     print("epsilon: ", epsilon, "randomize: ", randomize)
+    print("board step:", 
+          current_board.step, 
+          ",reward:", 
+          reward, 
+          ",epsilon:",
+          epsilon,
+          "randomize:",
+          randomize,
+          "action_space",
+          asm.emulator.get_action_space(current_board),
+          file=sys.__stdout__)
+    
     if randomize:
         randomize_action(current_board)
     else:
@@ -569,10 +587,6 @@ def agent(obs, config):
     asm.in_game_episodes_seen += 1
     
     return current_board.current_player.next_actions
-
-if not os.path.exists(TIMESTAMP):
-    os.makedirs(TIMESTAMP)
-env = make("halite", configuration={"size": BOARD_SIZE, "startingHalite": STARTING, "episodeSteps": EPISODE_STEPS, "actTimeout": 1e8, "runTimeout":1e8})
 
 def output_logs(env, steps, agent_managers):
     if hasattr(env, "logs") and env.logs is not None:
@@ -592,11 +606,22 @@ def output_logs(env, steps, agent_managers):
         with open("{0}/p{1}_qvals_{0}.txt".format(TIMESTAMP, asm.player_id), "w") as f:
             f.write(str(asm.q_values[asm.total_episodes_seen:
                                      asm.total_episodes_seen+asm.in_game_episodes_seen]))
-            
+
+if not os.path.exists(TIMESTAMP):
+    os.makedirs(TIMESTAMP)
+config = {
+    "size": BOARD_SIZE, 
+    "startingHalite": STARTING, 
+    "episodeSteps": EPISODE_STEPS, 
+    "actTimeout": 1e8, 
+    "runTimeout":1e8}
+if RANDOM_SEED > -1: config["randomSeed"] = RANDOM_SEED
+env = make("halite", configuration=config)
+
 print(env.configuration)
 i = 1
 from Halite_Swarm_Intelligence import swarm_agent
-agents = [agent, agent, swarm_agent, "random"]
+agents = [agent, "random", swarm_agent, "random"]
 agent_managers = {i: AgentStateManager(i) for i in range(4)}
     
 while i < GAME_COUNT:
