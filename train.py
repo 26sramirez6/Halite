@@ -23,15 +23,14 @@ BOARD_SIZE = 21
 PLAYERS = 4
 GAMMA = 0.7
 EGREEDY = 1
-EGREEDY_DECAY = 0.00005
-EGREEDY_LOWER_BOUND = .1
-GAME_BATCH_SIZE = 4
+EGREEDY_DECAY = 0.0001
+EGREEDY_LOWER_BOUND = 0.1
+GAME_BATCH_SIZE = 1
 TRAIN_BATCH_SIZE = 32
 LEARNING_RATE = 0.01
 CHANNELS = 7
 MOMENTUM  = 0.9
 SAMPLE_CYCLE = 10
-OUTPUT_LOGS = True
 EPOCHS = 8
 MAX_ACTION_SPACE = 200
 WEIGHT_DECAY = 5e-4
@@ -41,6 +40,8 @@ SHIP_MOVE_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,Shi
 TS_FTR_COUNT = 1 + PLAYERS*2 
 GAME_COUNT = 1000
 TIMESTAMP = str(datetime.datetime.now()).replace(' ', '_').replace(':', '.').replace('-',"_")
+SERIALIZE = True
+OUTPUT_LOGS = True
 RANDOM_SEED = -1; 
 if RANDOM_SEED > -1: 
     np.random.seed(RANDOM_SEED)
@@ -97,9 +98,10 @@ class AgentStateManager:
         
     def serialize(self):
         append = 'p{0}g{1}_{2}'.format(self.player_id, self.game_id, TIMESTAMP)
-        torch.save(self.geometric_ftrs[:self.total_episodes_seen], '{0}/geo_ftrs_{1}.tensor'.format(TIMESTAMP, append))
-        torch.save(self.time_series_ftrs[:self.total_episodes_seen], '{0}/ts_ftrs_{1}.tensor'.format(TIMESTAMP, append))
-        torch.save(self.q_values[:self.total_episodes_seen], '{0}/q_values_{1}.tensor'.format(TIMESTAMP, append))
+        if self.total_episodes_seen > 0:
+            torch.save(self.geometric_ftrs[:self.total_episodes_seen], '{0}/geo_ftrs_{1}.tensor'.format(TIMESTAMP, append))
+            torch.save(self.time_series_ftrs[:self.total_episodes_seen], '{0}/ts_ftrs_{1}.tensor'.format(TIMESTAMP, append))
+            torch.save(self.q_values[:self.total_episodes_seen], '{0}/q_values_{1}.tensor'.format(TIMESTAMP, append))
     
     def clear_data(self):
         self.total_episodes_seen = 0
@@ -168,6 +170,7 @@ class DQN(nn.Module):
         self._final_layer = nn.Linear(
                 fc_volume,
                 1)
+        nn.init.xavier_uniform_(self._final_layer.weight)
         
     def forward(self, geometric_x, ts_x):
         y = self._conv_layers[0](geometric_x)
@@ -289,24 +292,25 @@ def update_tensors(geometric_tensor, ts_tensor, board, current_ship_cargo, prior
         [halite[i:i+BOARD_SIZE] for i in 
          range(0, len(halite), BOARD_SIZE)], 
         dtype=torch.float) #@UndefinedVariable    
+    
     for my_ship in cp.ships:
-        geometric_tensor[1, my_ship.position.x, my_ship.position.y] = 1
-        geometric_tensor[2, my_ship.position.x, my_ship.position.y] = my_ship.halite
+        geometric_tensor[1, my_ship.position.y, my_ship.position.x] = 1
+        geometric_tensor[2, my_ship.position.y, my_ship.position.x] = my_ship.halite
         current_ship_cargo[0] += my_ship.halite
     for my_shipyard in cp.shipyards:
-        geometric_tensor[3, my_shipyard.position.x, my_shipyard.position.y] = 1
+        geometric_tensor[3, my_shipyard.position.y, my_shipyard.position.x] = 1
     
     for i, player in enumerate(board.opponents):
         for enemy_ship in player.ships:
-            geometric_tensor[4, enemy_ship.position.x, enemy_ship.position.y] = 1
-            geometric_tensor[5, enemy_ship.position.x, enemy_ship.position.y] = enemy_ship.halite
+            geometric_tensor[4, enemy_ship.position.y, enemy_ship.position.x] = 1
+            geometric_tensor[5, enemy_ship.position.y, enemy_ship.position.x] = enemy_ship.halite
             current_ship_cargo[i+1] += enemy_ship.halite
         for enemy_shipyard in player.shipyards:
-            geometric_tensor[6, enemy_shipyard.position.x, enemy_shipyard.position.y] = 1
-    
+            geometric_tensor[6, enemy_shipyard.position.y, enemy_shipyard.position.x] = 1
+        ts_tensor[i+2] = player.halite
+        
     ts_tensor[0] = board.configuration.episode_steps - board.step
-    for i, player in enumerate(board.players.values()):
-        ts_tensor[i+1] = player.halite
+    ts_tensor[1] = cp.halite
 #     ts_tensor[1: PLAYERS+1] = ts_tensor[1: PLAYERS+1] / ts_tensor[1: PLAYERS+1].max()
      
     ts_tensor[-PLAYERS:] = torch.max(player_zeros, current_ship_cargo - prior_ship_cargo) #@UndefinedVariable
@@ -472,14 +476,17 @@ class BoardEmulator:
             forward_batch_size = self._permutate_all_states(
                 board, ship_count, shipyard_count, current_halite)
             with torch.no_grad():
-                q_values = (self._rewards[:forward_batch_size] + 
-                    model(self._geometric_ftrs[:forward_batch_size], 
-                          self._ts_ftrs[:forward_batch_size]).view(-1))
+                next_qs = model(self._geometric_ftrs[:forward_batch_size], 
+                                 self._ts_ftrs[:forward_batch_size]).view(-1)
+            next_qs.mul_(GAMMA)
+            q_values = self._rewards[:forward_batch_size] + next_qs
                     
             max_q_idx = q_values.argmax()
             self._best_ship_actions[:ship_count] = self._ship_actions[max_q_idx, :ship_count]
             self._best_shipyard_actions[:shipyard_count] = self._shipyard_actions[max_q_idx, :shipyard_count]
         set_next_actions(board, self._best_ship_actions, self._best_shipyard_actions)
+        self._geometric_ftrs.fill_(0)
+        self._ts_ftrs.fill_(0)
     
 def train(model, criterion, agent_managers):
     model.train()
@@ -543,7 +550,7 @@ def compute_reward(
 def agent(obs, config):
     global agent_managers
     current_board = Board(obs, config)
-    
+        
     asm = agent_managers.get(current_board.current_player.id)
     ftr_index = asm.total_episodes_seen + asm.in_game_episodes_seen
     update_tensors(
@@ -648,7 +655,8 @@ while i < GAME_COUNT:
     if i % GAME_BATCH_SIZE == 0:
         train(dqn, huber, agent_managers)
         for asm in agent_managers.values():
-            asm.serialize()
+            if SERIALIZE:
+                asm.serialize()
             asm.clear_data()
             asm.game_id += GAME_BATCH_SIZE
     
