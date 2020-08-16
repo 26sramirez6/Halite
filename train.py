@@ -26,10 +26,10 @@ EGREEDY = 1
 EGREEDY_EPISODE_SIZE = 100
 EGREEDY_LOWER_BOUND = 0.01
 EGREEDY_DECAY = 0.0001
-GAME_BATCH_SIZE = 3
+GAME_BATCH_SIZE = 4
 TRAIN_BATCH_SIZE = 32
 LEARNING_RATE = 0.00001
-CHANNELS = 2
+CHANNELS = 3
 MOMENTUM  = 0.9
 SAMPLE_CYCLE = 10
 EPOCHS = 8
@@ -39,7 +39,7 @@ SHIPYARD_ACTIONS = [None, ShipyardAction.SPAWN]
 SHIP_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST,ShipAction.CONVERT]
 SHIP_MOVE_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST]
 TS_FTR_COUNT = 1 + PLAYERS*2 
-GAME_COUNT = 7
+GAME_COUNT = 1000
 TIMESTAMP = str(datetime.datetime.now()).replace(' ', '_').replace(':', '.').replace('-',"_")
 SERIALIZE = True
 OUTPUT_LOGS = True
@@ -338,7 +338,7 @@ def update_tensors(geometric_tensor, ts_tensor, board, current_ship_cargo, prior
         fleet_heat[my_ship.position.y, my_ship.position.x] = .75
         
         current_ship_cargo[0] += my_ship.halite
-#         geometric_tensor[1, BOARD_SIZE - my_ship.position.y - 1, my_ship.position.x] = 1
+        geometric_tensor[1, BOARD_SIZE - my_ship.position.y - 1, my_ship.position.x] = my_ship.halite
 #         geometric_tensor[2, BOARD_SIZE - my_ship.position.y - 1, my_ship.position.x] = my_ship.halite
 
     fleet_heat = 1. / fleet_heat
@@ -349,7 +349,7 @@ def update_tensors(geometric_tensor, ts_tensor, board, current_ship_cargo, prior
         out=geometric_tensor[0])
         
     for my_shipyard in cp.shipyards:
-        geometric_tensor[1, BOARD_SIZE - my_shipyard.position.y - 1, my_shipyard.position.x] = current_ship_cargo[0]
+        geometric_tensor[2, BOARD_SIZE - my_shipyard.position.y - 1, my_shipyard.position.x] = current_ship_cargo[0]
     
     for i, player in enumerate(board.opponents):
         for enemy_ship in player.ships:
@@ -686,7 +686,7 @@ def agent(obs, config):
     global agent_managers
     
     current_board = Board(obs, config)
-    if current_board.step == 4:
+    if current_board.step == 26:
         pause = True
     asm = agent_managers.get(current_board.current_player.id)
     step = current_board.step        
