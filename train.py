@@ -38,8 +38,8 @@ SHIPYARD_ACTIONS = [None, ShipyardAction.SPAWN]
 SHIP_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST,ShipAction.CONVERT]
 SHIP_MOVE_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST]
 TS_FTR_COUNT = 1 + PLAYERS*2 
-GAME_COUNT = 100
-TIMESTAMP = str(datetime.datetime.now()).replace(' ', '_').replace(':', '.').replace('-',"_")
+GAME_COUNT = 2
+TIMESTAMP = "2020_08_16_11.44.56.814822"#str(datetime.datetime.now()).replace(' ', '_').replace(':', '.').replace('-',"_")
 SERIALIZE = True
 OUTPUT_LOGS = True
 RANDOM_SEED = -1; 
@@ -614,7 +614,10 @@ def compute_reward(
         prior_deposited_halite,
         ships_converted):
     if current_board.step==0: return 0
-        
+    
+    steps_remaining = EPISODE_STEPS - prior_board.step
+    prior_player = prior_board.current_player
+    current_player = current_board.current_player
     halite_cargo_reward = (diff_halite_cargo * 
                            mined_reward_weights).sum().item()
     
@@ -623,38 +626,59 @@ def compute_reward(
     
     halite_deposited_reward = current_deposited_halite[0] - prior_deposited_halite[0]#max(0,(current_deposited_halite[0] - prior_deposited_halite[0]).item())
     
-    prior_ships_set = set([ship.id for ship in prior_board.current_player.ships])
-    current_ships_set = set([ship.id for ship in current_board.current_player.ships])
-    prior_shipyards_set = set([shipyard.id for shipyard in prior_board.current_player.shipyards])
-    current_shipyards_set = set([shipyard.id for shipyard in current_board.current_player.shipyards])
+    prior_ships_set = set([ship.id for ship in prior_player.ships])
+    current_ships_set = set([ship.id for ship in current_player.ships])
+    prior_shipyards_set = set([shipyard.id for shipyard in prior_player.shipyards])
+    current_shipyards_set = set([shipyard.id for shipyard in current_player.shipyards])
     
     my_ships_lost_from_collision = max(0, len(prior_ships_set.difference(current_ships_set)) - ships_converted)
     my_shipyards_lost_from_collision = len(prior_shipyards_set.difference(current_shipyards_set))
     
-    my_ships_built = len(current_ships_set.difference(prior_ships_set))
-    my_shipyards_built = len(current_shipyards_set.difference(prior_shipyards_set))
-    
-    reward = (halite_deposited_score_diff*-1 +
-              halite_cargo_score_diff*-1 +
-              halite_deposited_reward*1 +
-              halite_cargo_reward*1 + 
-              my_ships_lost_from_collision*-750 +
-              my_shipyards_lost_from_collision*-750)
+#     my_ships_built = len(current_ships_set.difference(prior_ships_set))
+#     my_shipyards_built = len(current_shipyards_set.difference(prior_shipyards_set))
+#     
+#     reward = (halite_deposited_score_diff*-1 +
+#               halite_cargo_score_diff*-1 +
+#               halite_deposited_reward*1 +
+#               halite_cargo_reward*1 + 
+#               my_ships_lost_from_collision*-750 +
+#               my_shipyards_lost_from_collision*-750)
 #               my_ships_built*500 +
 #               my_shipyards_built*500)
     
+    ships_intersection = prior_ships_set.intersection(current_ships_set)
+    inactive_ships = 0
+    inactive_shipyards = 0
+    for ship_id in ships_intersection:
+        prior_ship = prior_board.ships[ship_id]
+        if prior_ship.next_action == None:
+            current_ship = current_board.ships[ship_id]
+            if current_ship.halite == prior_ship.halite:
+                inactive_ships += 1
+    
+    # condition for enabling inactivity check on shipyards
+    if len(prior_player.shipyards) > len(prior_player.ships):
+        shipyards_intersection = prior_shipyards_set.intersection(current_shipyards_set)
+        for shipyard_id in shipyards_intersection:
+            prior_shipyard = prior_board.shipyards[shipyard_id]
+            if prior_shipyard.next_action == None:
+                inactive_shipyards += 1
+                
+    inactivity_factor = -prior_board.configuration.max_cell_halite*prior_board.configuration.collect_rate
     return (
         max(0,diff_halite_cargo[0].item()) + 
-        halite_deposited_reward*(1 + current_board.step*reward_step) + 
+        halite_deposited_reward*(.5 + current_board.step*reward_step) + 
         my_ships_lost_from_collision*-750 +
-        my_shipyards_lost_from_collision*-750)
+        my_shipyards_lost_from_collision*-750 +
+        inactive_ships*(inactivity_factor) +
+        inactive_shipyards*(inactivity_factor))
 #     return reward
 
 def agent(obs, config):
     global agent_managers
     
     current_board = Board(obs, config)
-    if current_board.step==22:
+    if current_board.step == 4:
         pause = True
     asm = agent_managers.get(current_board.current_player.id)
     ftr_index = asm.total_episodes_seen + asm.in_game_episodes_seen
