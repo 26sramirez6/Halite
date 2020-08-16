@@ -22,10 +22,11 @@ STARTING = 5000
 BOARD_SIZE = 21
 PLAYERS = 4
 GAMMA = 0.9
-EGREEDY = 0.02
-EGREEDY_LOWER_BOUND = 0.02
-EGREEDY_DECAY = 0.001
-GAME_BATCH_SIZE = 4
+EGREEDY = 1
+EGREEDY_EPISODE_SIZE = 100
+EGREEDY_LOWER_BOUND = 0.01
+EGREEDY_DECAY = 0.0001
+GAME_BATCH_SIZE = 3
 TRAIN_BATCH_SIZE = 32
 LEARNING_RATE = 0.00001
 CHANNELS = 2
@@ -38,8 +39,8 @@ SHIPYARD_ACTIONS = [None, ShipyardAction.SPAWN]
 SHIP_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST,ShipAction.CONVERT]
 SHIP_MOVE_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST]
 TS_FTR_COUNT = 1 + PLAYERS*2 
-GAME_COUNT = 2
-TIMESTAMP = "2020_08_16_11.44.56.814822"#str(datetime.datetime.now()).replace(' ', '_').replace(':', '.').replace('-',"_")
+GAME_COUNT = 7
+TIMESTAMP = str(datetime.datetime.now()).replace(' ', '_').replace(':', '.').replace('-',"_")
 SERIALIZE = True
 OUTPUT_LOGS = True
 RANDOM_SEED = -1; 
@@ -83,7 +84,8 @@ class AgentStateManager:
         self.prior_ship_cargo = torch.zeros(PLAYERS, dtype=torch.float).to(device) #@UndefinedVariable
         
         self.emulator = BoardEmulator(self.time_series_ftrs)
-        
+        self.randomized_episodes = []
+    
     def set_prior_board(self, prior_board):
         self.prior_board = prior_board
     
@@ -95,8 +97,8 @@ class AgentStateManager:
         torch.matmul(
             self.gamma_mat[:self.in_game_episodes_seen, :self.in_game_episodes_seen], 
             self.episode_rewards[self.total_episodes_seen: self.total_episodes_seen + self.in_game_episodes_seen], 
-            out=self.q_values[self.total_episodes_seen: self.total_episodes_seen + self.in_game_episodes_seen]) #@UndefinedVariable
-        
+            out=self.q_values[self.total_episodes_seen: self.total_episodes_seen + self.in_game_episodes_seen]) #@UndefinedVariable        
+    
     def serialize(self):
         append = 'p{0}g{1}_{2}'.format(self.player_id, self.game_id, TIMESTAMP)
         if self.total_episodes_seen > 0:
@@ -112,8 +114,10 @@ class AgentStateManager:
         self.time_series_ftrs.fill_(0)
         self.episode_rewards.fill_(0)
         self.q_values.fill_(0)
+        self.randomized_episodes = []
     
     def post_game_data_clear(self):
+        self.randomized_episodes.append((self.total_episodes_seen, self.total_episodes_seen + EGREEDY_EPISODE_SIZE))
         self.total_episodes_seen += self.in_game_episodes_seen
         self.in_game_episodes_seen = 0
         self.prior_ships_converted = 0
@@ -224,8 +228,10 @@ dqn = DQN(
     0,  # padding
     1#TS_FTR_COUNT# number of extra time series features
     ).to(device)  
+
+if os.path.exists("{0}/dqn_{0}.nn".format(TIMESTAMP)):
+    dqn.load_state_dict(torch.load("{0}/dqn_{0}.nn".format(TIMESTAMP)))
     
-dqn.load_state_dict(torch.load("{0}/dqn_{0}.nn".format(TIMESTAMP)))
 print(dqn)
 
 optimizer = torch.optim.SGD( #@UndefinedVariable
@@ -581,6 +587,8 @@ def train(model, criterion, agent_managers):
     for e in range(EPOCHS):
         for asm in agent_managers.values():
             idxs = list(range(asm.total_episodes_seen))
+            for random_sample in asm.randomized_episodes:
+                idxs = [i for i in idxs if i < random_sample[0] or i >= random_sample[1]]
             np.random.shuffle(idxs)
             for j, i in enumerate(range(0, len(idxs), TRAIN_BATCH_SIZE)):
                 train_idx = idxs[i:i+TRAIN_BATCH_SIZE]
@@ -681,6 +689,7 @@ def agent(obs, config):
     if current_board.step == 4:
         pause = True
     asm = agent_managers.get(current_board.current_player.id)
+    step = current_board.step        
     ftr_index = asm.total_episodes_seen + asm.in_game_episodes_seen
     update_tensors(
         asm.geometric_ftrs[ftr_index], 
@@ -697,21 +706,22 @@ def agent(obs, config):
         asm.current_ship_cargo,
         asm.time_series_ftrs[ftr_index, -PLAYERS: ], 
         asm.time_series_ftrs[ftr_index, 1:  1 + PLAYERS], 
-        None if current_board.step==0 else asm.time_series_ftrs[ftr_index-1, 1:  1 + PLAYERS],
+        None if step==0 else asm.time_series_ftrs[ftr_index-1, 1:  1 + PLAYERS],
         asm.prior_ships_converted)
     
     asm.episode_rewards[ftr_index] = reward
     
+    
     epsilon = max(EGREEDY_LOWER_BOUND, EGREEDY*((1-EGREEDY_DECAY)**dqn.trained_examples))
     randomize = np.random.rand() < epsilon
     
-    if randomize:
+    if step < EGREEDY_EPISODE_SIZE and randomize:
         q, ships_converted = randomize_action(current_board)
     else:
         q, ships_converted = asm.emulator.select_action(current_board, dqn)
     
     print("board step:", 
-          current_board.step, 
+          step, 
           ",reward:", 
           reward, 
           ",q:",
