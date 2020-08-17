@@ -23,7 +23,7 @@ BOARD_SIZE = 21
 PLAYERS = 4
 GAMMA = 0.9
 EGREEDY = 1
-EGREEDY_EPISODE_SIZE = 100
+EGREEDY_EPISODE_SIZE = 150
 EGREEDY_LOWER_BOUND = 0.01
 EGREEDY_DECAY = 0.0001
 GAME_BATCH_SIZE = 4
@@ -39,7 +39,7 @@ SHIPYARD_ACTIONS = [None, ShipyardAction.SPAWN]
 SHIP_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST,ShipAction.CONVERT]
 SHIP_MOVE_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST]
 TS_FTR_COUNT = 1 + PLAYERS*2 
-GAME_COUNT = 1000
+GAME_COUNT = 4
 TIMESTAMP = str(datetime.datetime.now()).replace(' ', '_').replace(':', '.').replace('-',"_")
 SERIALIZE = True
 OUTPUT_LOGS = True
@@ -85,6 +85,7 @@ class AgentStateManager:
         
         self.emulator = BoardEmulator(self.time_series_ftrs)
         self.randomized_episodes = []
+        self.random_episode_bound = np.random.randint(0, EGREEDY_EPISODE_SIZE)
     
     def set_prior_board(self, prior_board):
         self.prior_board = prior_board
@@ -102,9 +103,13 @@ class AgentStateManager:
     def serialize(self):
         append = 'p{0}g{1}_{2}'.format(self.player_id, self.game_id, TIMESTAMP)
         if self.total_episodes_seen > 0:
-            torch.save(self.geometric_ftrs[:self.total_episodes_seen], '{0}/geo_ftrs_{1}.tensor'.format(TIMESTAMP, append))
-            torch.save(self.time_series_ftrs[:self.total_episodes_seen], '{0}/ts_ftrs_{1}.tensor'.format(TIMESTAMP, append))
-            torch.save(self.q_values[:self.total_episodes_seen], '{0}/q_values_{1}.tensor'.format(TIMESTAMP, append))
+            idxs = list(range(self.total_episodes_seen))
+            for random_sample in self.randomized_episodes:
+                idxs = [i for i in idxs if i < random_sample[0] or i >= random_sample[1]]
+                
+            torch.save(self.geometric_ftrs[idxs], '{0}/geo_ftrs_{1}.tensor'.format(TIMESTAMP, append))
+            torch.save(self.time_series_ftrs[idxs], '{0}/ts_ftrs_{1}.tensor'.format(TIMESTAMP, append))
+            torch.save(self.q_values[idxs], '{0}/q_values_{1}.tensor'.format(TIMESTAMP, append))
     
     def post_batch_data_clear(self):
         self.total_episodes_seen = 0
@@ -117,10 +122,11 @@ class AgentStateManager:
         self.randomized_episodes = []
     
     def post_game_data_clear(self):
-        self.randomized_episodes.append((self.total_episodes_seen, self.total_episodes_seen + EGREEDY_EPISODE_SIZE))
+        self.randomized_episodes.append((self.total_episodes_seen, self.total_episodes_seen + self.random_episode_bound))
         self.total_episodes_seen += self.in_game_episodes_seen
         self.in_game_episodes_seen = 0
         self.prior_ships_converted = 0
+        self.random_episode_bound = np.random.randint(0, EGREEDY_EPISODE_SIZE)
         
 def timer(func):
     @functools.wraps(func)
@@ -219,7 +225,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu") #@Undefine
 player_zeros = torch.zeros(PLAYERS, dtype=torch.float).to(device) #@UndefinedVariable
 huber = nn.SmoothL1Loss()
 dqn = DQN(
-    3, # number of conv layers
+    4, # number of conv layers
     2,  # number of fully connected layers at end
     64, # number of neurons in fully connected layers at end
     4,  # number of start filters for conv layers (depth)
@@ -252,8 +258,8 @@ def randomize_action(board):
                 current_halite -= board.configuration.convert_cost
                 ships_converted += 1
         else:
-            my_ship.next_action = choice(SHIP_ACTIONS)
-            
+            my_ship.next_action = choice(SHIP_MOVE_ACTIONS)
+        
     for my_shipyard in board.current_player.shipyards:
         if current_halite > board.configuration.spawn_cost:
             my_shipyard.next_action = choice(SHIPYARD_ACTIONS)
@@ -715,7 +721,7 @@ def agent(obs, config):
     epsilon = max(EGREEDY_LOWER_BOUND, EGREEDY*((1-EGREEDY_DECAY)**dqn.trained_examples))
     randomize = np.random.rand() < epsilon
     
-    if step < EGREEDY_EPISODE_SIZE and randomize:
+    if step < asm.random_episode_bound and randomize:
         q, ships_converted = randomize_action(current_board)
     else:
         q, ships_converted = asm.emulator.select_action(current_board, dqn)
@@ -769,10 +775,9 @@ config = {
     "episodeSteps": EPISODE_STEPS, 
     "actTimeout": 1e8, 
     "runTimeout":1e8}
-if RANDOM_SEED > -1: config["randomSeed"] = RANDOM_SEED
-env = make("halite", configuration=config)
 
-print(env.configuration)
+if RANDOM_SEED > -1: 
+    config["randomSeed"] = RANDOM_SEED
 
 i = 1
 from Halite_Swarm_Intelligence import swarm_agent
@@ -780,6 +785,8 @@ agents = [agent]#, "random", "random", "random"]
 agent_managers = {i: AgentStateManager(i) for i in range(4)}
 
 while i < GAME_COUNT:
+    env = make("halite", configuration=config)
+    print(env.configuration)
     env.reset(PLAYERS)
     np.random.shuffle(agents)
     active_agents = set([j for j, el in enumerate(agents) if el==agent])
