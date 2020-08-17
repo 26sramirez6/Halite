@@ -719,9 +719,9 @@ def agent(obs, config):
     
     
     epsilon = max(EGREEDY_LOWER_BOUND, EGREEDY*((1-EGREEDY_DECAY)**dqn.trained_examples))
-    randomize = np.random.rand() < epsilon
+    randomize = step < asm.random_episode_bound and np.random.rand() < epsilon
     
-    if step < asm.random_episode_bound and randomize:
+    if randomize:
         q, ships_converted = randomize_action(current_board)
     else:
         q, ships_converted = asm.emulator.select_action(current_board, dqn)
