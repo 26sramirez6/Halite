@@ -24,9 +24,9 @@ PLAYERS = 4
 GAMMA = 0.9
 EGREEDY = 1
 EGREEDY_EPISODE_SIZE = 150
-EGREEDY_LOWER_BOUND = 0.01
+EGREEDY_LOWER_BOUND = 0.1
 EGREEDY_DECAY = 0.0001
-GAME_BATCH_SIZE = 4
+GAME_BATCH_SIZE = 1
 TRAIN_BATCH_SIZE = 32
 LEARNING_RATE = 0.00001
 CHANNELS = 3
@@ -39,7 +39,7 @@ SHIPYARD_ACTIONS = [None, ShipyardAction.SPAWN]
 SHIP_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST,ShipAction.CONVERT]
 SHIP_MOVE_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST]
 TS_FTR_COUNT = 1 + PLAYERS*2 
-GAME_COUNT = 4
+GAME_COUNT = 1000
 TIMESTAMP = str(datetime.datetime.now()).replace(' ', '_').replace(':', '.').replace('-',"_")
 SERIALIZE = True
 OUTPUT_LOGS = True
@@ -79,14 +79,20 @@ class AgentStateManager:
         self.q_values = torch.zeros(
             EPISODE_STEPS*GAME_BATCH_SIZE, 
             dtype=torch.float).to(device) #@UndefinedVariable
-            
+        
+        self.tdiffs = torch.zeros(
+            EPISODE_STEPS*GAME_BATCH_SIZE, 
+            dtype=torch.float64).to(device) #@UndefinedVariable
+        
         self.current_ship_cargo = torch.zeros(PLAYERS, dtype=torch.float).to(device) #@UndefinedVariable
         self.prior_ship_cargo = torch.zeros(PLAYERS, dtype=torch.float).to(device) #@UndefinedVariable
         
         self.emulator = BoardEmulator(self.time_series_ftrs)
         self.randomized_episodes = []
         self.random_episode_bound = np.random.randint(0, EGREEDY_EPISODE_SIZE)
-    
+        
+        self.game_starts = [0]
+        
     def set_prior_board(self, prior_board):
         self.prior_board = prior_board
     
@@ -95,11 +101,32 @@ class AgentStateManager:
         self.emulator.set_prior_ship_cargo(prior_ship_cargo)
     
     def compute_q_post_game(self):
+        start = self.total_episodes_seen
+        end = self.total_episodes_seen + self.in_game_episodes_seen
         torch.matmul(
             self.gamma_mat[:self.in_game_episodes_seen, :self.in_game_episodes_seen], 
-            self.episode_rewards[self.total_episodes_seen: self.total_episodes_seen + self.in_game_episodes_seen], 
-            out=self.q_values[self.total_episodes_seen: self.total_episodes_seen + self.in_game_episodes_seen]) #@UndefinedVariable        
+            self.episode_rewards[start: end], 
+            out=self.q_values[start: end]) #@UndefinedVariable
     
+    def post_batch_compute_priorities(self):
+        for i in range(len(self.game_starts)-1):
+            start = self.game_starts[i] 
+            end = self.game_starts[i+1]
+            self.tdiffs[start] = 0
+            self.tdiffs[start+1 : end] = self.q_values[start + 1 : end] - self.q_values[start : end - 1]
+        self.tdiffs.abs_()
+        mask = self.tdiffs[:self.total_episodes_seen]==0
+        self.tdiffs[:self.total_episodes_seen][mask] = self.tdiffs.mean().item()
+        pi = (self.tdiffs[:self.total_episodes_seen]**0.9) # alpha=0.9
+        self.q_priorities = pi / pi.sum()
+    
+    def generate_priority_samples(self):
+        return np.random.choice(
+            list(range(self.total_episodes_seen)), 
+            size=self.total_episodes_seen, 
+            replace=True, 
+            p=self.q_priorities)   
+        
     def serialize(self):
         append = 'p{0}g{1}_{2}'.format(self.player_id, self.game_id, TIMESTAMP)
         if self.total_episodes_seen > 0:
@@ -120,10 +147,13 @@ class AgentStateManager:
         self.episode_rewards.fill_(0)
         self.q_values.fill_(0)
         self.randomized_episodes = []
+        self.game_starts = [0]
     
     def post_game_data_clear(self):
         self.randomized_episodes.append((self.total_episodes_seen, self.total_episodes_seen + self.random_episode_bound))
         self.total_episodes_seen += self.in_game_episodes_seen
+        if self.total_episodes_seen > self.game_starts[-1]:
+            self.game_starts.append(self.total_episodes_seen)
         self.in_game_episodes_seen = 0
         self.prior_ships_converted = 0
         self.random_episode_bound = np.random.randint(0, EGREEDY_EPISODE_SIZE)
@@ -225,10 +255,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu") #@Undefine
 player_zeros = torch.zeros(PLAYERS, dtype=torch.float).to(device) #@UndefinedVariable
 huber = nn.SmoothL1Loss()
 dqn = DQN(
-    4, # number of conv layers
+    3, # number of conv layers
     2,  # number of fully connected layers at end
     64, # number of neurons in fully connected layers at end
-    4,  # number of start filters for conv layers (depth)
+    8,  # number of start filters for conv layers (depth)
     3,  # size of kernel
     1,  # stride of the kernel
     0,  # padding
@@ -322,10 +352,17 @@ spatial = torch.tensor((
     [[(i,j) for i in range(BOARD_SIZE)] for j in range(BOARD_SIZE)]), 
     dtype=torch.float).reshape(-1,2)
 from scipy.spatial import distance
-
-def update_tensors(geometric_tensor, ts_tensor, board, current_ship_cargo, prior_ship_cargo):        
-    cp = board.current_player
+fleet_heat = np.full((BOARD_SIZE, BOARD_SIZE), BOARD_SIZE*2, dtype=np.float)
+shipyard_heat = np.full((BOARD_SIZE, BOARD_SIZE), BOARD_SIZE*2, dtype=np.float)
+def update_tensors(geometric_tensor, ts_tensor, board, current_ship_cargo, prior_ship_cargo):     
+    global fleet_heat
+    global shipyard_heat
+    geometric_tensor.fill_(0)
+    ts_tensor.fill_(0)
     current_ship_cargo.fill_(0)
+    fleet_heat.fill(BOARD_SIZE*2)
+    shipyard_heat.fill(BOARD_SIZE*2)
+    cp = board.current_player
     halite = board.observation["halite"]
     
     geometric_tensor[0] = torch.as_tensor(
@@ -333,8 +370,6 @@ def update_tensors(geometric_tensor, ts_tensor, board, current_ship_cargo, prior
          range(0, len(halite), BOARD_SIZE)], 
         dtype=torch.float) #@UndefinedVariable 
 #     geometric_tensor[0].div_(geometric_tensor[0].max())
-    
-    fleet_heat = np.full((BOARD_SIZE, BOARD_SIZE), BOARD_SIZE*2, dtype=np.float)
     
     for my_ship in cp.ships:
         heat = distance.cdist(
@@ -353,10 +388,20 @@ def update_tensors(geometric_tensor, ts_tensor, board, current_ship_cargo, prior
         geometric_tensor[0], 
         flipped, 
         out=geometric_tensor[0])
-        
-    for my_shipyard in cp.shipyards:
-        geometric_tensor[2, BOARD_SIZE - my_shipyard.position.y - 1, my_shipyard.position.x] = current_ship_cargo[0]
     
+    for my_shipyard in cp.shipyards:
+        heat = distance.cdist(
+            spatial, [(my_shipyard.position.x, my_shipyard.position.y)], 
+            metric="cityblock").reshape(BOARD_SIZE, BOARD_SIZE)
+        shipyard_heat = np.minimum(shipyard_heat, heat)
+        shipyard_heat[my_shipyard.position.y, my_shipyard.position.x] = 0.75
+        geometric_tensor[0, BOARD_SIZE - my_shipyard.position.y - 1, my_shipyard.position.x] = current_ship_cargo[0]*5
+    
+    shipyard_heat = 1. / shipyard_heat
+    flipped = torch.flip(torch.as_tensor(shipyard_heat, dtype=torch.float), dims=(0,))
+    geometric_tensor[2] = torch.flip(torch.as_tensor(shipyard_heat, dtype=torch.float), dims=(0,))
+    geometric_tensor[2].mul_(current_ship_cargo[0]*5)
+        
     for i, player in enumerate(board.opponents):
         for enemy_ship in player.ships:
             geometric_tensor[4, enemy_ship.position.y, enemy_ship.position.x] = 1
@@ -476,6 +521,8 @@ class BoardEmulator:
         halite_for_shipyard_conversion = current_halite // 2
         halite_for_ship_spawn = current_halite // 2
         ships_converted = 0
+        q_values = []
+        rewards = []
         for i in ship_idxs:
             for j, _ in enumerate(SHIP_ACTIONS):
                 if SHIP_ACTIONS[j]==ShipAction.CONVERT:
@@ -512,6 +559,9 @@ class BoardEmulator:
                 
                 with torch.no_grad():
                     q_value = reward + GAMMA*model(self._geometric_ftrs[0:1], self._ts_ftrs[0:1]).item()
+                    
+                q_values.append(q_value)
+                rewards.append(reward)
                 if q_value > max_q_value:
                     max_q_value = q_value
                     self._best_ship_actions[:ship_count] = self._ship_actions[0, :ship_count]
@@ -554,6 +604,8 @@ class BoardEmulator:
                 
                 with torch.no_grad():
                     q_value = reward + GAMMA*model(self._geometric_ftrs[0:1], self._ts_ftrs[0:1]).item()
+                q_values.append(q_value)
+                rewards.append(reward)
                 if q_value > max_q_value:
                     max_q_value = q_value
                     self._best_ship_actions[:ship_count] = self._ship_actions[0, :ship_count]
@@ -563,6 +615,8 @@ class BoardEmulator:
                         halite_for_ship_spawn += board.configuration.spawn_cost
                         
             self._shipyard_actions[0,i] = self._best_shipyard_actions[i]
+        
+        print("qvalues:", q_values, "rewards:",rewards, file=sys.__stdout__)
         return max_q_value
     
     def get_action_space(self, board):
@@ -592,21 +646,19 @@ def train(model, criterion, agent_managers):
     model.train()
     for e in range(EPOCHS):
         for asm in agent_managers.values():
-            idxs = list(range(asm.total_episodes_seen))
-            for random_sample in asm.randomized_episodes:
-                idxs = [i for i in idxs if i < random_sample[0] or i >= random_sample[1]]
-            np.random.shuffle(idxs)
-            for j, i in enumerate(range(0, len(idxs), TRAIN_BATCH_SIZE)):
-                train_idx = idxs[i:i+TRAIN_BATCH_SIZE]
-                y_pred = model(
-                    asm.geometric_ftrs[train_idx], 
-                    asm.time_series_ftrs[train_idx])
-                loss = criterion(y_pred.view(-1), asm.q_values[train_idx])
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+            if asm.total_episodes_seen > 0:
+                idxs = asm.generate_priority_samples()
+                for j, i in enumerate(range(0, len(idxs), TRAIN_BATCH_SIZE)):
+                    train_idx = idxs[i:i+TRAIN_BATCH_SIZE]
+                    y_pred = model(
+                        asm.geometric_ftrs[train_idx], 
+                        asm.time_series_ftrs[train_idx])
+                    loss = criterion(y_pred.view(-1), asm.q_values[train_idx])
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
                 
-                print("Epoch: {}, Train batch iteration: {}, Loss: {}".format(e, j, loss.item()))
+                    print("Epoch: {}, Train batch iteration: {}, Loss: {}".format(e, j, loss.item()))
             if e==0:
                 model.trained_examples += len(idxs) 
 #     for layer in model._conv_layers:
@@ -634,7 +686,7 @@ def compute_reward(
     current_player = current_board.current_player
     halite_cargo_reward = (diff_halite_cargo * 
                            mined_reward_weights).sum().item()
-    
+#     print(diff_halite_cargo, file=sys.__stdout__)
     halite_deposited_score_diff = (max(current_deposited_halite) - current_deposited_halite[0]).item()
     halite_cargo_score_diff = (max(current_halite_cargo) - current_halite_cargo[0]).item()
     
@@ -678,7 +730,7 @@ def compute_reward(
             if prior_shipyard.next_action == None:
                 inactive_shipyards += 1
                 
-    inactivity_factor = -prior_board.configuration.max_cell_halite*prior_board.configuration.collect_rate
+    inactivity_factor = -25
     return (
         max(0,diff_halite_cargo[0].item()) + 
         halite_deposited_reward*(.5 + current_board.step*reward_step) + 
@@ -692,8 +744,7 @@ def agent(obs, config):
     global agent_managers
     
     current_board = Board(obs, config)
-    if current_board.step == 26:
-        pause = True
+    
     asm = agent_managers.get(current_board.current_player.id)
     step = current_board.step        
     ftr_index = asm.total_episodes_seen + asm.in_game_episodes_seen
@@ -807,6 +858,9 @@ while i < GAME_COUNT:
         asm.post_game_data_clear()        
         
     if i % GAME_BATCH_SIZE == 0:
+        for asm in agent_managers.values():
+            asm.post_batch_compute_priorities()
+        
         train(dqn, huber, agent_managers)
         for asm in agent_managers.values():
             if SERIALIZE:
