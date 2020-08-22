@@ -20,6 +20,7 @@ from kaggle_environments import make #@UnusedImport
 from random import choice #@UnusedImport
 
 EPISODE_STEPS = 400
+MAX_EPISODES_MEMORY = 65536
 STARTING = 5000
 BOARD_SIZE = 21
 PLAYERS = 4
@@ -59,111 +60,176 @@ class AgentStateManager:
         for i in range(EPISODE_STEPS):
             cls.gamma_mat[i, (1+i):] = cls.gamma_vec[:EPISODE_STEPS-(1+i)]
         
-    def __init__(self, player_id):
+    def __init__(self, 
+            player_id,
+            ship_model, 
+            shipyard_model, 
+            ship_model_criterion, 
+            shipyard_model_criterion, 
+            ship_model_optimizer, 
+            shipyard_model_optimizer):
+        
         self.player_id = player_id
         self.game_id = 0
         self.prior_board = None
         self.prior_ships_converted = 0
+        self._ship_model_samples = 0
+        self._shipyard_model_samples = 0
         self.total_episodes_seen = 0
         self.in_game_episodes_seen = 0
-        self.geometric_ftrs = torch.zeros(
-            (EPISODE_STEPS*GAME_BATCH_SIZE, CHANNELS, BOARD_SIZE, BOARD_SIZE), 
-            dtype=torch.float).to(device) #@UndefinedVariable
+        
+        self._geo_ship_ftrs = torch.zeros(
+            (MAX_EPISODES_MEMORY, CHANNELS, BOARD_SIZE, BOARD_SIZE),
+            dtype=torch.float).to(DEVICE)
+        
+        self._geo_shipyard_ftrs = torch.zeros(
+            (MAX_EPISODES_MEMORY, CHANNELS, BOARD_SIZE, BOARD_SIZE),
+            dtype=torch.float).to(DEVICE)
+        
+        self._ts_ftrs = torch.zeros(
+            (MAX_EPISODES_MEMORY, TS_FTR_COUNT),
+            dtype=torch.float).to(DEVICE)
+        
+        self._Q_ship = torch.zeros(
+            MAX_EPISODES_MEMORY,
+            dtype=torch.float).to(DEVICE)
+        
+        self._Q_shipyard = torch.zeros(
+            MAX_EPISODES_MEMORY,
+            dtype=torch.float).to(DEVICE)
+        
+        self._target_Q_ship = torch.zeros(
+            MAX_EPISODES_MEMORY,
+            dtype=torch.float).to(DEVICE)
+        
+        self._target_Q_shipyard = torch.zeros(
+            MAX_EPISODES_MEMORY,
+            dtype=torch.float).to(DEVICE)
+        
+        self._tdiffs_ship = torch.rand(
+            MAX_EPISODES_MEMORY,
+            dtype=torch.float).to(DEVICE)
+        
+        self._tdiffs_shipyard = torch.rand(
+            MAX_EPISODES_MEMORY,
+            dtype=torch.float).to(DEVICE)
+        
+        self.current_ship_cargo = torch.zeros(
+            PLAYERS, 
+            dtype=torch.float).to(DEVICE) #@UndefinedVariable
             
-        self.time_series_ftrs = torch.zeros(
-            (EPISODE_STEPS*GAME_BATCH_SIZE, TS_FTR_COUNT), 
-            dtype=torch.float).to(device) #@UndefinedVariable
-            
+        self.prior_ship_cargo = torch.zeros(
+            PLAYERS, 
+            dtype=torch.float).to(DEVICE) #@UndefinedVariable
+        
         self.episode_rewards = torch.zeros(
-            EPISODE_STEPS*GAME_BATCH_SIZE, 
-            dtype=torch.float).to(device) #@UndefinedVariable
+            MAX_EPISODES_MEMORY, 
+            dtype=torch.float).to(DEVICE) #@UndefinedVariable
         
-        self.q_values = torch.zeros(
-            EPISODE_STEPS*GAME_BATCH_SIZE, 
-            dtype=torch.float).to(device) #@UndefinedVariable
-        
-        self.tdiffs = torch.zeros(
-            EPISODE_STEPS*GAME_BATCH_SIZE, 
-            dtype=torch.float64).to(device) #@UndefinedVariable
-        
-        self.current_ship_cargo = torch.zeros(PLAYERS, dtype=torch.float).to(device) #@UndefinedVariable
-        self.prior_ship_cargo = torch.zeros(PLAYERS, dtype=torch.float).to(device) #@UndefinedVariable
-        
-        self.emulator = BoardEmulator(self.time_series_ftrs)
-        self.randomized_episodes = []
-        self.random_episode_bound = np.random.randint(0, EGREEDY_EPISODE_SIZE)
-        
-        self.game_starts = [0]
+        self.action_selector = ActionSelector(
+            self, 
+            self._ts_ftrs, 
+            ship_model, 
+            shipyard_model, 
+            ship_model_criterion, 
+            shipyard_model_criterion, 
+            ship_model_optimizer, 
+            shipyard_model_optimizer)     
         
     def set_prior_board(self, prior_board):
         self.prior_board = prior_board
     
     def set_prior_ship_cargo(self, prior_ship_cargo):
         self.prior_ship_cargo.copy_(prior_ship_cargo)
-        self.emulator.set_prior_ship_cargo(prior_ship_cargo)
-    
-    def compute_q_post_game(self):
-        start = self.total_episodes_seen
-        end = self.total_episodes_seen + self.in_game_episodes_seen
-        torch.matmul(
-            self.gamma_mat[:self.in_game_episodes_seen, :self.in_game_episodes_seen], 
-            self.episode_rewards[start: end], 
-            out=self.q_values[start: end]) #@UndefinedVariable
+        self.action_selector.set_prior_ship_cargo(prior_ship_cargo)
     
     def compute_total_reward_post_game(self):
         return self.episode_rewards[self.total_episodes_seen: 
             self.total_episodes_seen + self.in_game_episodes_seen].sum().item()
     
-    def post_batch_compute_priorities(self):
-        for i in range(len(self.game_starts)-1):
-            start = self.game_starts[i] 
-            end = self.game_starts[i+1]
-            self.tdiffs[start] = 0
-            self.tdiffs[start+1 : end] = self.q_values[start + 1 : end] - self.q_values[start : end - 1]
-        self.tdiffs.abs_()
-        mask = self.tdiffs[:self.total_episodes_seen]==0
-        self.tdiffs[:self.total_episodes_seen][mask] = self.tdiffs.mean().item()
-        pi = (self.tdiffs[:self.total_episodes_seen]**0.9) # alpha=0.9
-        self.q_priorities = pi / pi.sum()
-    
-    def generate_priority_samples(self):
-        return np.random.choice(
-            list(range(self.total_episodes_seen)), 
-            size=self.total_episodes_seen, 
-            replace=True, 
-            p=self.q_priorities)   
+    def priority_sample(self, isShip):
+        if isShip:
+            ship_end = MAX_EPISODES_MEMORY if self._ship_buffer_filled else self._ship_model_samples
+            ship_idxs = np.random.choice(
+                list(range(ship_end)), 
+                size=ship_end, 
+                replace=True, 
+                p=self._target_Q_ship_priorities) 
+            return (self._geo_ship_ftrs[ship_idxs], 
+                    self._ts_ftrs[ship_idxs], 
+                    self._target_Q_ship[ship_idxs])
+        else:
+            shipyard_end = MAX_EPISODES_MEMORY if self._shipyard_buffer_filled else self._shipyard_model_samples
+            shipyard_idxs = np.random.choice(
+                list(range(shipyard_end)), 
+                size=shipyard_end, 
+                replace=True, 
+                p=self._target_Q_shipyard_priorities) 
+            return (self._geo_shipyard_ftrs[shipyard_idxs], 
+                    self._ts_ftrs[shipyard_idxs], 
+                    self._target_Q_shipyard[shipyard_idxs])       
         
-    def serialize(self):
-        append = 'p{0}g{1}_{2}'.format(self.player_id, self.game_id, TIMESTAMP)
-        if self.total_episodes_seen > 0:
-            idxs = list(range(self.total_episodes_seen))
-#             for random_sample in self.randomized_episodes:
-#                 idxs = [i for i in idxs if i < random_sample[0] or i >= random_sample[1]]
-                
-            torch.save(self.geometric_ftrs[idxs], '{0}/geo_ftrs_{1}.tensor'.format(TIMESTAMP, append))
-            torch.save(self.time_series_ftrs[idxs], '{0}/ts_ftrs_{1}.tensor'.format(TIMESTAMP, append))
-            torch.save(self.q_values[idxs], '{0}/q_values_{1}.tensor'.format(TIMESTAMP, append))
-    
-    def post_batch_data_clear(self):
-        self.total_episodes_seen = 0
-        self.in_game_episodes_seen = 0
-        self.prior_ships_converted = 0
-        self.geometric_ftrs.fill_(0)
-        self.time_series_ftrs.fill_(0)
-        self.episode_rewards.fill_(0)
-        self.q_values.fill_(0)
-        self.randomized_episodes = []
-        self.game_starts = [0]
-    
-    def post_game_data_clear(self):
-        self.randomized_episodes.append((self.total_episodes_seen, self.total_episodes_seen + self.random_episode_bound))
-        self.total_episodes_seen += self.in_game_episodes_seen
-        if self.total_episodes_seen > self.game_starts[-1]:
-            self.game_starts.append(self.total_episodes_seen)
-        self.in_game_episodes_seen = 0
-        self.prior_ships_converted = 0
-        self.random_episode_bound = np.random.randint(0, EGREEDY_EPISODE_SIZE)
+    def store(self,
+        ship_count,
+        shipyard_count,
+        geo_ship_ftrs, 
+        geo_shipyard_ftrs, 
+        pred_Q_ship,
+        pred_Q_shipyard,
+        target_Q_ship,
+        target_Q_shipyard) :
         
+        if self._ship_model_samples + ship_count > MAX_EPISODES_MEMORY:
+            self._ship_buffer_filled = True
+            self._ship_model_samples = 0
+        
+        if self._ship_model_samples + shipyard_count > MAX_EPISODES_MEMORY:
+            self._shipyard_buffer_filled = True
+            self._shipyard_model_samples = 0
+            
+        start_ship = self._ship_model_samples
+        end_ship = self._ship_model_samples + ship_count
+        start_shipyard = self._shipyard_model_samples
+        end_shipyard = self._shipyard_model_samples + shipyard_count
+        self._geo_ship_ftrs[start_ship:end_ship] = geo_ship_ftrs
+        self._geo_shipyard_ftrs[start_shipyard:end_shipyard] = geo_shipyard_ftrs
+        self._Q_ship[start_ship:end_ship] = pred_Q_ship
+        self._Q_shipyard[start_shipyard:end_shipyard] = pred_Q_shipyard
+        self._target_Q_ship[start_ship:end_ship] = target_Q_ship
+        self._target_Q_shipyard[start_shipyard:end_shipyard] = target_Q_shipyard
+        
+        ### ship priorities ###
+        self._tdiffs_ship[start_ship+1 : end_ship] = (
+            self._target_Q_ship[start_ship + 1 : end_ship] - 
+            self._target_Q_ship[start_ship : end_ship-1] ).abs()
+        
+        if start_ship==0:
+            self._tdiffs_ship[0] = self._tdiffs_ship.mean().item()
+        else:
+            self._tdiffs_ship[0] = abs(self._tdiffs_ship[start_ship] - self._tdiffs_ship[start_ship-1]) 
+        
+        mask = self._tdiffs_ship==0
+        self._tdiffs_ship[start_ship: end_ship][mask] = 1e-5
+        pi = (self._tdiffs_ship[0: self._tdiffs_ship.shape[0] if self._ship_buffer_filled else end_ship]**0.9) # alpha=0.9
+        self._target_Q_ship_priorities = pi / pi.sum()
+        
+        ### shipyard priorities ###
+        self._tdiffs_shipyard[start_shipyard+1 : end_shipyard] = (
+            self._target_Q_shipyard[start_shipyard + 1 : end_shipyard] - 
+            self._target_Q_shipyard[start_shipyard : end_shipyard-1] ).abs()
+        
+        if start_shipyard==0:
+            self._tdiffs_shipyard[0] = self._tdiffs_shipyard.mean().item()
+        else:
+            self._tdiffs_shipyard[0] = abs(self._tdiffs_shipyard[start_shipyard] - self._tdiffs_shipyard[start_shipyard-1]) 
+        
+        mask = self._tdiffs_shipyard==0
+        self._tdiffs_shipyard[start_shipyard:end_shipyard][mask] = 1e-5
+        pi = (self._tdiffs_shipyard[0 : self._tdiffs_shipyards.shape[0] if self._shipyard_buffer_filled else end_shipyard]**0.9) # alpha=0.9
+        self._target_Q_shipyard_priorities = pi / pi.sum()
+        
+
+    
 def timer(func):
     @functools.wraps(func)
     def wrapper_timer(*args, **kwargs):
@@ -359,7 +425,6 @@ spatial = torch.tensor((
     dtype=torch.float).reshape(-1,2)
 from scipy.spatial import distance
 fleet_heat = np.full((BOARD_SIZE, BOARD_SIZE), BOARD_SIZE*2, dtype=np.float)
-shipyard_heat = np.full((BOARD_SIZE, BOARD_SIZE), BOARD_SIZE*2, dtype=np.float)
 def update_tensors_v2(
     geometric_ship_ftrs, 
     geometric_shipyard_ftrs, 
@@ -369,23 +434,19 @@ def update_tensors_v2(
     prior_ship_cargo):
     
     global fleet_heat
-    global shipyard_heat
     geometric_ship_ftrs.fill_(0)
     geometric_shipyard_ftrs.fill_(0)
     ts_ftrs.fill_(0)
     current_ship_cargo.fill_(0)
     fleet_heat.fill((BOARD_SIZE*2)**2)
-    shipyard_heat.fill(BOARD_SIZE*2)
     cp = board.current_player
     halite = board.observation["halite"]
     ts_ftrs[0] = float(board.configuration.episode_steps - board.step) / board.configuration.episode_steps
-    
-    if len(cp.ships)>0:
-        halite_tensor = torch.as_tensor(
+    halite_tensor = torch.as_tensor(
             [halite[i:i+BOARD_SIZE] for i in 
              range(0, len(halite), BOARD_SIZE)], 
             dtype=torch.float) 
-        
+    if len(cp.ships)>0:        
         geometric_ship_ftrs[:] = halite_tensor
         geometric_shipyard_ftrs[:] = halite_tensor
     
@@ -405,7 +466,7 @@ def update_tensors_v2(
             current_ship_cargo[0] += my_ship.halite
     
     if len(cp.shipyards)>0:
-#         np.multiply(ts_ftrs[0], fleet_heat, out=fleet_heat)
+        np.divide(1, fleet_heat, out=fleet_heat)
         for i, my_shipyard in enumerate(cp.shipyards):
             heat = distance.cdist(
                 spatial, [(my_shipyard.position.x, my_shipyard.position.y)], 
@@ -417,65 +478,83 @@ def update_tensors_v2(
             
             np.divide(1, heat, out=heat)
             
-            flipped = torch.flip(torch.as_tensor(shipyard_heat, dtype=torch.float), dims=(0,))
-            geometric_shipyard_ftrs[2] = torch.flip(torch.as_tensor(shipyard_heat, dtype=torch.float), dims=(0,))
-            geometric_shipyard_ftrs[2].mul_(max(100,current_ship_cargo[0]))
+            flipped = torch.flip(torch.as_tensor(heat, dtype=torch.float), dims=(0,))
+            np.multiply(ts_ftrs[0], flipped, out=flipped)
+            torch.mul(halite_tensor, flipped, out=geometric_shipyard_ftrs[i])
             
             geometric_ship_ftrs[:, BOARD_SIZE - my_shipyard.position.y - 1, my_shipyard.position.x] = max(100, current_ship_cargo[0])
-            
-        for my_shipyard in cp.shipyards:
-            heat = distance.cdist(
-                spatial, [(my_shipyard.position.x, my_shipyard.position.y)], 
-                metric="cityblock").reshape(BOARD_SIZE, BOARD_SIZE)
-            shipyard_heat = np.minimum(shipyard_heat, heat)
-            shipyard_heat[my_shipyard.position.y, my_shipyard.position.x] = 0.25
-            
-    
-    
-    shipyard_heat = 0.5 / shipyard_heat
-    flipped = torch.flip(torch.as_tensor(shipyard_heat, dtype=torch.float), dims=(0,))
-    geometric_tensor[2] = torch.flip(torch.as_tensor(shipyard_heat, dtype=torch.float), dims=(0,))
-    geometric_tensor[2].mul_(max(100,current_ship_cargo[0]))
+                    
+    ts_ftrs[1] = cp.halite
+    for i, enemy in enumerate(board.opponents):
+        ts_ftrs[2 + i] = enemy.halite
         
-    ts_tensor[1] = cp.halite
     ts_tensor[-PLAYERS:] = torch.max(player_zeros, current_ship_cargo - prior_ship_cargo) #@UndefinedVariable
     
     return
 
-class BoardEmulator:
-    def __init__(self, agent_ts_ftrs):
+class ActionSelector:
+    def __init__(self, 
+            agent_manager,
+            agent_ts_ftrs, 
+            ship_model, 
+            shipyard_model, 
+            ship_model_criterion,
+            shipyard_model_criterion,
+            ship_model_optimizer,
+            shipyard_model_optimizer):
+        
+        self._agent_manager = agent_manager
+        self._ship_model = ship_model
+        self._shipyard_model = shipyard_model
+        self._ship_model_criterion = ship_model_criterion
+        self._shipyard_model_criterion = shipyard_model_criterion
+        self._ship_model_optimizer = ship_model_optimizer
+        self._shipyard_model_optimizer = shipyard_model_optimizer
+        
         self._agent_ts_ftrs = agent_ts_ftrs
-        self._geometric_ftrs = torch.zeros((MAX_ACTION_SPACE, CHANNELS, BOARD_SIZE, BOARD_SIZE), dtype=torch.float).to(device) #@UndefinedVariable
-        self._ts_ftrs = torch.zeros((MAX_ACTION_SPACE, TS_FTR_COUNT), dtype=torch.float).to(device) #@UndefinedVariable
         
         self._prior_ship_cargo = torch.zeros(PLAYERS, dtype=torch.float).to(device) #@UndefinedVariable
         self._current_ship_cargo = torch.zeros(PLAYERS, dtype=torch.float).to(device) #@UndefinedVariable
         
-        self._rewards = torch.zeros(MAX_ACTION_SPACE, dtype=torch.float).to(device) #@UndefinedVariable
-        # assume a max amount of ships and shipyards to
-        # so we can allocate upfront
-        self._ship_actions = np.zeros((MAX_ACTION_SPACE, BOARD_SIZE**2), dtype=np.int32)
-        self._shipyard_actions = np.zeros((MAX_ACTION_SPACE, BOARD_SIZE**2), dtype=np.int32)
         self._best_ship_actions = np.zeros(BOARD_SIZE**2, dtype=np.int32)
         self._best_shipyard_actions = np.zeros(BOARD_SIZE**2, dtype=np.int32)
         
-        self._geometric_ship_ftrs_v2 = torch.zeros(
+        self._geometric_ship_ftrs_v2 = torch.zeros(#@UndefinedVariable
             (2, BOARD_SIZE**2, CHANNELS, BOARD_SIZE, BOARD_SIZE), 
-            dtype=torch.float).to(device)
+            dtype=torch.float).to(device)#@UndefinedVariable
         
-        self._geometric_shipyard_ftrs_v2 = torch.zeros(
+        self._geometric_shipyard_ftrs_v2 = torch.zeros(#@UndefinedVariable
             (2, BOARD_SIZE**2, CHANNELS, BOARD_SIZE, BOARD_SIZE), 
-            dtype=torch.float).to(device)
+            dtype=torch.float).to(device)#@UndefinedVariable
             
-        self._ts_ftrs_v2 = torch.zeros(
+        self._ts_ftrs_v2 = torch.zeros(#@UndefinedVariable
             (2, TS_FTR_COUNT), 
-            dtype=torch.float).to(device)
+            dtype=torch.float).to(device)#@UndefinedVariable
         
+        self._Q_ships_current_adj = torch.zeros(#@UndefinedVariable
+            (BOARD_SIZE**2, len(SHIP_ACTIONS)),
+            dtype=torch.float).to(device)#@UndefinedVariable
+        
+        self._Q_shipyards_current_adj = torch.zeros(#@UndefinedVariable
+            (BOARD_SIZE**2, len(SHIPYARD_ACTIONS)),
+            dtype=torch.float).to(device)#@UndefinedVariable
+            
     def set_prior_ship_cargo(self, prior_ship_cargo):
         self._prior_ship_cargo[:] = prior_ship_cargo
     
-    def _ship_iterator_model(self, ship_model, shipyard_model, board, ship_count, shipyard_count, current_halite):
-        ships_converted = 0
+    def _ship_iterator_model(
+            self, 
+            board, 
+            ship_count, 
+            shipyard_count, 
+            current_halite):
+        
+        self._ship_model.eval()
+        self._shipyard_model.eval()
+        self._best_ship_actions.fill(0)
+        self._best_shipyard_actions.fill(0)
+        self._Q_ships_current_adj.fill_(0)
+        self._Q_shipyards_current_adj.fill_(0)
         
         update_tensors_v2(
             self._geometric_ship_ftrs_v2[0], 
@@ -485,18 +564,40 @@ class BoardEmulator:
             self._current_ship_cargo, 
             self._prior_ship_cargo)
         
-        with torch.no_grad():
-            Q_ships_current = ship_model(self._geometric_ftrs_v2[0], self._ts_ftrs_v2[1])
-            Q_shipyards_current = shipyard_model(self._geometric_ftrs_v2[0], self._ts_ftrs_v2[1])
+        max_new_shipyards_allowed = int(current_halite * .2) // board.configuration.convert_cost
+        max_new_ships_allowed = int(current_halite * .8) // board.configuration.spawn_cost
         
-        self._best_ship_actions[:ship_count] = Q_ships_current.argmax(dim=1)
-        self._best_shipyard_actions[:shipyard_count] = Q_shipyards_current.argmax(dim=1)
+        with torch.no_grad():
+            Q_ships_current = self._ship_model(self._geometric_ftrs_v2[0], self._ts_ftrs_v2[0])
+            Q_shipyards_current = self._shipyard_model(self._geometric_ftrs_v2[0], self._ts_ftrs_v2[0])
+        
+        self._Q_ships_current_adj[:ship_count] = Q_ships_current
+        retmax = Q_ships_current.max(dim=1)
+        conversion_indices = np.where(retmax.indices==5)[0][max_new_shipyards_allowed:]
+        self._Q_ships_current_adj[conversion_indices, 5] = float('-inf')
+        self._best_ship_actions[:ship_count] = self._Q_ships_current_adj[:ship_count].argmax(dim=1)
+        
+        retmax = Q_shipyards_current.max(dim=1)
+        shipyard_actions_f = retmax.indices.type(dtype=torch.float)
+        torch.mul(shipyard_actions_f, retmax.values, out=shipyard_actions_f)
+        shipyard_actions_f[shipyard_actions_f==0] = float('-inf')
+        self._best_shipyard_actions[shipyard_actions_f.argsort(descending=True) < max_new_ships_allowed] = 1
+                
+        self._prior_ship_cargo.copy_(self._current_ship_cargo)
         
         new_board = step_forward(
             board, 
             self._best_ship_actions, 
             self._best_shipyard_actions)
-         
+                
+        update_tensors_v2(
+            self._geometric_ship_ftrs_v2[1], 
+            self._geometric_shipyard_ftrs_v2[1], 
+            self._ts_ftrs_v2[1], 
+            new_board, 
+            self._current_ship_cargo, 
+            self._prior_ship_cargo)
+        
         reward = compute_reward(
             new_board, 
             board, 
@@ -504,21 +605,13 @@ class BoardEmulator:
             self._ts_ftrs_v2[0, -PLAYERS: ], 
             self._ts_ftrs_v2[0, 1:  1 + PLAYERS], 
             self._agent_ts_ftrs[board.step, 1:  1 + PLAYERS],
-            ships_converted)
-         
-        update_tensors_v2(
-            self._geometric_ship_ftrs_v2[1], 
-            self._geometric_shipyard_ftrs_v2[1], 
-            self._ts_ftrs_v2, 
-            new_board, 
-            self._current_ship_cargo, 
-            self._prior_ship_cargo)
-         
+            (self._best_ship_actions==5).sum())
+                  
         with torch.no_grad():
-            Q_ships_next = ship_model(self._geometric_ftrs_v2[1], self._ts_ftrs_v2[1])
-            Q_shipyards_next = shipyard_model(self._geometric_ftrs_v2[1], self._ts_ftrs_v2[1])
+            Q_ships_next = self._ship_model(self._geometric_ftrs_v2[1], self._ts_ftrs_v2[1])
+            Q_shipyards_next = self._shipyard_model(self._geometric_ftrs_v2[1], self._ts_ftrs_v2[1])
         
-        self._replay_buffer.store(
+        self._agent_manager.store(
             self._geometric_ship_ftrs_v2[0], 
             self._geometric_shipyard_ftrs_v2[0], 
             Q_ships_current,
@@ -526,212 +619,64 @@ class BoardEmulator:
             reward + Q_ships_next,
             reward + Q_shipyards_next)
         
-        geometric_ftrs, ts_ftrs, labels = self._replay_buffer.prioritized_sample(TRAIN_BATCH_SIZE)
-        train_model(ship_model, geometric_ftrs, ts_ftrs, labels)
-        train_model(shipyard_model, geometric_ftrs, ts_ftrs, labels)
-        
-        return 
-    
-    def _permutate_all_states(self, model, board, ship_count, shipyard_count, current_halite):
-        forward_batch_size = 0
-        for l in product(range(len(SHIP_ACTIONS)), repeat=ship_count):
-            ship_halite = current_halite // 2
-            ships_converted = 0
-            for i, j in enumerate(l):
-                if SHIP_ACTIONS[j]==ShipAction.CONVERT:
-                    if ship_halite < board.configuration.convert_cost:
-                        j = 0 # set to none action
-                    else:
-                        ships_converted += 1
-                        ship_halite -= board.configuration.convert_cost
-                        
-                self._ship_actions[forward_batch_size, i] = j
-                    
-            for y in product(range(len(SHIPYARD_ACTIONS)), repeat=shipyard_count):
-                shipyard_halite = current_halite // 2
-                    
-                for i, j in enumerate(y):
-                    if SHIPYARD_ACTIONS[j]==ShipyardAction.SPAWN:
-                        if shipyard_halite < board.configuration.spawn_cost:
-                            j = 0 # set to none
-                        else:
-                            shipyard_halite -= board.configuration.spawn_cost
-                    self._shipyard_actions[forward_batch_size, i] = j
-                
-                new_board = step_forward(
-                    board, 
-                    self._ship_actions[forward_batch_size], 
-                    self._shipyard_actions[forward_batch_size])
-                
-                update_tensors(
-                    self._geometric_ftrs[forward_batch_size], 
-                    self._ts_ftrs[forward_batch_size], 
-                    new_board, 
-                    self._current_ship_cargo, 
-                    self._prior_ship_cargo)
-
-                self._rewards[forward_batch_size] = compute_reward(
-                    new_board, 
-                    board, 
-                    self._current_ship_cargo,
-                    self._ts_ftrs[forward_batch_size, -PLAYERS: ], 
-                    self._ts_ftrs[forward_batch_size, 1:  1 + PLAYERS], 
-                    self._agent_ts_ftrs[board.step, 1:  1 + PLAYERS],
-                    ships_converted)
-                forward_batch_size += 1
-        
-        with torch.no_grad():
-            next_qs = model(self._geometric_ftrs[:forward_batch_size], 
-                            self._ts_ftrs[:forward_batch_size]).view(-1)
-        if PRINT_STATEMENTS:
-            print("qs:", next_qs, file=sys.__stdout__)
-            print("rewards:", self._rewards[:forward_batch_size], file=sys.__stdout__)
-        next_qs.mul_(GAMMA)
-        q_values = self._rewards[:forward_batch_size] + next_qs
-#         print(next_qs)
-        
-        max_q_idx = q_values.argmax()
-        self._best_ship_actions[:ship_count] = self._ship_actions[max_q_idx, :ship_count]
-        self._best_shipyard_actions[:shipyard_count] = self._shipyard_actions[max_q_idx, :shipyard_count]
+        geo_ship_ftrs, ts_ftrs_ship, ship_targets = 
+            self._agent_manager.priority_sample(TRAIN_BATCH_SIZE, True)
             
-        return q_values.max()
-    
-    def _guess_best_states(self, model, board, ship_count, shipyard_count, current_halite):
-        # choose a random ship, find the best action for this ship while holding the rest at 0
-        # then choose another ship, holding the previous ship at it's best action. 
-        # continue for all ships
-        max_q_value = float('-inf')
-        self._ship_actions.fill(0)
-        self._shipyard_actions.fill(0)
-        ship_idxs = list(range(ship_count))
-        shipyard_idxs = list(range(shipyard_count))
-        np.random.shuffle(ship_idxs)
-        np.random.shuffle(shipyard_idxs)
-        halite_for_shipyard_conversion = current_halite // 2
-        halite_for_ship_spawn = current_halite // 2
-        ships_converted = 0
-        q_values = []
-        rewards = []
-        for i in ship_idxs:
-            for j, _ in enumerate(SHIP_ACTIONS):
-                if SHIP_ACTIONS[j]==ShipAction.CONVERT:
-                    if halite_for_shipyard_conversion < board.configuration.convert_cost:
-                        continue
-                    else:
-                        halite_for_shipyard_conversion -= board.configuration.convert_cost
-                        ships_converted += 1
-                            
-                self._geometric_ftrs[0].fill_(0)
-                self._ts_ftrs[0].fill_(0)
-                self._ship_actions[0, i] = j
-            
-                new_board = step_forward(
-                    board, 
-                    self._ship_actions[0], 
-                    self._shipyard_actions[0])
-                
-                update_tensors(
-                    self._geometric_ftrs[0], 
-                    self._ts_ftrs[0], 
-                    new_board, 
-                    self._current_ship_cargo, 
-                    self._prior_ship_cargo)
-                
-                reward = compute_reward(
-                    new_board, 
-                    board, 
-                    self._current_ship_cargo,
-                    self._ts_ftrs[0, -PLAYERS: ], 
-                    self._ts_ftrs[0, 1:  1 + PLAYERS], 
-                    self._agent_ts_ftrs[board.step, 1:  1 + PLAYERS],
-                    ships_converted)
-                
-                with torch.no_grad():
-                    q_value = reward + GAMMA*model(self._geometric_ftrs[0:1], self._ts_ftrs[0:1]).item()
-                    
-                q_values.append(q_value)
-                rewards.append(reward)
-                if q_value >= max_q_value:
-                    max_q_value = q_value
-                    self._best_ship_actions[:ship_count] = self._ship_actions[0, :ship_count]
-                    self._best_shipyard_actions[:shipyard_count] = self._shipyard_actions[0, :shipyard_count]
-                else: # need to add the construction halite back to what it was before since we didn't choose this
-                    if SHIP_ACTIONS[j]==ShipAction.CONVERT:
-                        halite_for_shipyard_conversion += board.configuration.convert_cost
-                        ships_converted -= 1
-                        
-            self._ship_actions[0, i] = self._best_ship_actions[i]
-            
-        for i in shipyard_idxs:
-            for j, _ in enumerate(SHIPYARD_ACTIONS):
-                if SHIPYARD_ACTIONS[j]==ShipyardAction.SPAWN:
-                    if halite_for_ship_spawn < board.configuration.spawn_cost:
-                        continue # since not a viable option
-                    else:
-                        halite_for_ship_spawn -= board.configuration.spawn_cost
-                            
-                self._geometric_ftrs[0].fill_(0)
-                self._ts_ftrs[0].fill_(0)
-                self._shipyard_actions[0,i] = j
-            
-                new_board = step_forward(board, self._ship_actions[0], self._shipyard_actions[0])
-                update_tensors(
-                    self._geometric_ftrs[0], 
-                    self._ts_ftrs[0], 
-                    new_board, 
-                    self._current_ship_cargo, 
-                    self._prior_ship_cargo)
-                
-                reward = compute_reward(
-                    new_board, 
-                    board, 
-                    self._current_ship_cargo,
-                    self._ts_ftrs[0, -PLAYERS: ], 
-                    self._ts_ftrs[0, 1:  1 + PLAYERS], 
-                    self._agent_ts_ftrs[board.step, 1:  1 + PLAYERS],
-                    ships_converted)
-                
-                with torch.no_grad():
-                    q_value = reward + GAMMA*model(self._geometric_ftrs[0:1], self._ts_ftrs[0:1]).item()
-                q_values.append(q_value)
-                rewards.append(reward)
-                if q_value >= max_q_value:
-                    max_q_value = q_value
-                    self._best_ship_actions[:ship_count] = self._ship_actions[0, :ship_count]
-                    self._best_shipyard_actions[:shipyard_count] = self._shipyard_actions[0, :shipyard_count]
-                else:
-                    if SHIPYARD_ACTIONS[j]==ShipyardAction.SPAWN:
-                        halite_for_ship_spawn += board.configuration.spawn_cost
-                        
-            self._shipyard_actions[0,i] = self._best_shipyard_actions[i]
+        geo_shipyards_ftrs, ts_ftrs_shipyard, shipyards_targets = 
+            self._agent_manager.priority_sample(TRAIN_BATCH_SIZE, False)
         
-        if PRINT_STATEMENTS:
-            print("qvalues:", len(q_values), "rewards:", len(rewards), file=sys.__stdout__)
-        return max_q_value
-    
+        train_model(
+            self._ship_model, 
+            "ship_dqn",
+            self._ship_model_criterion, 
+            self._ship_model_optimizer, 
+            geo_ship_ftrs, 
+            ts_ftrs_ship, 
+            ship_targets)
+        
+        train_model(
+            geo_shipyards_ftrs, 
+            "shipyard_dqn",
+            self._shipyard_model_criterion,
+            self._shipyard_model_optimizer,
+            geo_shipyards_ftrs, 
+            ts_ftrs_shipyard, 
+            shipyards_targets)
+        
+        return reward
+            
     def get_action_space(self, board):
         ship_count = len(board.current_player.ships)
         shipyard_count = len(board.current_player.shipyards)
         action_space = (len(SHIP_ACTIONS)**ship_count) * (len(SHIPYARD_ACTIONS)**shipyard_count)
         return action_space
     
-    def select_action(self, board, model):
-        model.eval()
+    def select_action(self, board):
         ship_count = len(board.current_player.ships)
         shipyard_count = len(board.current_player.shipyards)
-        action_space = (len(SHIP_ACTIONS)**ship_count) * (len(SHIPYARD_ACTIONS)**shipyard_count)
         current_halite = board.current_player.halite
         
-        if action_space > MAX_ACTION_SPACE:
-            q = self._guess_best_states(model, board, ship_count, shipyard_count, current_halite)
-        else:
-            q = self._permutate_all_states(model, board, ship_count, shipyard_count, current_halite)
+        self._ship_iterator_model(
+            board, 
+            ship_count, 
+            shipyard_count, 
+            current_halite)            
             
         ships_converted = set_next_actions(board, self._best_ship_actions, self._best_shipyard_actions)
-        self._geometric_ftrs.fill_(0)
-        self._ts_ftrs.fill_(0)
-        return (q, ships_converted)
-    
+        return ships_converted
+
+def train_model(model, model_name, criterion, optimizer, geo_ftrs, ts_ftrs, labels):
+    model.train()
+    for e in range(EPOCHS):
+        y_pred = model(geo_ftrs, ts_ftrs)
+        loss = criterion(y_pred.view(-1), labels)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        print("Epoch {0}, Board step {}, Train batch loss: {}".format(e, j, loss.item()))
+    torch.save(model.state_dict(), "{0}/{1}_{0}.nn".format(TIMESTAMP, model_name))
+
+
 def train(model, criterion, agent_managers):
     model.train()
     for e in range(EPOCHS):
@@ -868,7 +813,7 @@ def agent(obs, config):
     if randomize:
         q, ships_converted = randomize_action(current_board)
     else:
-        q, ships_converted = asm.emulator.select_action(current_board, dqn)
+        q, ships_converted = asm.action_selector.select_action(current_board, dqn)
     
     if PRINT_STATEMENTS:
         print("board step:", 
@@ -882,7 +827,7 @@ def agent(obs, config):
               "randomize:",
               randomize,
               "action_space",
-              asm.emulator.get_action_space(current_board),
+              asm.action_selector.get_action_space(current_board),
               file=sys.__stdout__)
     
     asm.prior_ships_converted = ships_converted
