@@ -801,13 +801,35 @@ class RewardEngine:
         
         if current_board.step==0: return 0
         
+        rewards = {sid:0 for sid in self._prior_ships_set}
+        
         prior_player = prior_board.current_player
         current_player = current_board.current_player
         
-        current_ships_set = set([ship.id for ship in current_player.ships])        
-        my_ships_lost_from_collision = self._prior_ships_set.difference(self._ships_converted).difference(current_ships_set)
+        current_ships_set = set([ship.id for ship in current_player.ships])
+        current_halite_cargo = {ship.id: ship.halite for ship in current_player.ships}
+                
+        my_ships_lost_from_collision = self._prior_ships_set.difference(ships_converted).difference(current_ships_set)
+        rewards.update({sid: -750 for sid in my_ships_lost_from_collision})
+        retained_ships = current_ships_set.intersection(self._prior_ships_set)
+        
+        diff_halite_cargo = {ship.id: 
+            max(0, current_halite_cargo[ship.id] - ship.halite) 
+            if ship.id in retained_ships else 0 
+            for ship in self._prior_halite_cargo}
+        
+        diff_halite_deposited = {ship.id: 
+            ship.halite - current_halite_cargo[ship.id]  
+            if ship.id in retained_ships else 0 
+            for ship in self._prior_halite_cargo}
+        
+        inactivity = {ship.id:
+            ship.halite==current_halite_cargo[ship.id]
+            if ship.id in retained_ships else 0
+            for ship in self._prior_halite_cargo}
+        
         self._prior_ships_set = current_ships_set
-    
+        self._prior_halite_cargo = current_halite_cargo
         
 
 def agent(obs, config):
