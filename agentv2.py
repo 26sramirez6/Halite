@@ -469,7 +469,7 @@ class ActionSelector:
         self._shipyard_model_criterion = shipyard_model_criterion
         self._ship_model_optimizer = ship_model_optimizer
         self._shipyard_model_optimizer = shipyard_model_optimizer
-        
+        self._reward_engine = RewardEngine()
         self._agent_ts_ftrs = agent_ts_ftrs
         
         self._prior_ship_cargo = torch.zeros(PLAYERS, dtype=torch.float).to(DEVICE) #@UndefinedVariable
@@ -497,6 +497,26 @@ class ActionSelector:
         self._Q_shipyards_current_adj = torch.zeros(#@UndefinedVariable
             (MAX_SHIPS, len(SHIPYARD_ACTIONS)),
             dtype=torch.float).to(DEVICE)#@UndefinedVariable
+        
+        self._Q_ships_next = torch.zeros(#@UndefinedVariable
+            MAX_SHIPS,
+            dtype=torch.float).to(DEVICE)#@UndefinedVariable
+        
+        self._Q_shipyards_next = torch.zeros(#@UndefinedVariable
+            MAX_SHIPS,
+            dtype=torch.float).to(DEVICE)#@UndefinedVariable
+        
+        self._ship_rewards = torch.zeros(#@UndefinedVariable
+            MAX_SHIPS, dtype=torch.float).to(DEVICE)#@UndefinedVariable
+        
+        self._shipyard_rewards = torch.zeros(#@UndefinedVariable
+            MAX_SHIPS, dtype=torch.float).to(DEVICE)#@UndefinedVariable
+            
+        self._non_terminal_ships = torch.zeros(#@UndefinedVariable
+            MAX_SHIPS, dtype=torch.bool).to(DEVICE)#@UndefinedVariable
+        
+        self._non_terminal_shipyards = torch.zeros(#@UndefinedVariable
+            MAX_SHIPS, dtype=torch.bool).to(DEVICE)#@UndefinedVariable
             
     def set_prior_ship_cargo(self, prior_ship_cargo):
         self._prior_ship_cargo[:] = prior_ship_cargo
@@ -514,6 +534,8 @@ class ActionSelector:
         self._best_shipyard_actions.fill(0)
         self._Q_ships_current_adj.fill_(0)
         self._Q_shipyards_current_adj.fill_(0)
+        self._non_terminal_ships.fill_(1)
+        self._non_terminal_shipyards.fill_(1)
         
         update_tensors_v2(
             self._geometric_ship_ftrs_v2[0], 
@@ -536,21 +558,20 @@ class ActionSelector:
                     self._geometric_shipyard_ftrs_v2[0, :shipyard_count], 
                     self._ts_ftrs_v2[0, :shipyard_count])
         
-        Q_sum_current = 0
         if ship_count > 0:
             self._Q_ships_current_adj[:ship_count] = Q_ships_current
             retmax = Q_ships_current.max(dim=1)
+            Q_ships_current_max = retmax.values
             conversion_indices = np.where(retmax.indices==5)[0][max_new_shipyards_allowed:]
             self._Q_ships_current_adj[conversion_indices, 5] = float('-inf')
             self._best_ship_actions[:ship_count] = self._Q_ships_current_adj[:ship_count].argmax(dim=1)
-            Q_sum_current += retmax.values.sum().item()
         if shipyard_count > 0:
             retmax = Q_shipyards_current.max(dim=1)
+            Q_shipyards_current_max = retmax.values
             shipyard_actions_f = retmax.indices.type(dtype=torch.float)
             torch.mul(shipyard_actions_f, retmax.values, out=shipyard_actions_f)
             shipyard_actions_f[shipyard_actions_f==0] = float('-inf')
             self._best_shipyard_actions[shipyard_actions_f.argsort(descending=True) < max_new_ships_allowed] = 1
-            Q_sum_current += retmax.values.sum().item()
         self._prior_ship_cargo.copy_(self._current_ship_cargo)
         
         new_board = step_forward(
@@ -566,45 +587,55 @@ class ActionSelector:
             self._current_ship_cargo, 
             self._prior_ship_cargo)
         
-        reward = compute_reward(
-            new_board, # board at t + 1
-            board, # board at t
-            self._current_ship_cargo, # current halite cargo
-            self._ts_ftrs_v2[1, 0, -PLAYERS: ], # diff halite cargo
-            self._ts_ftrs_v2[1, 0, 1:  1 + PLAYERS], # current halite score
-            self._agent_ts_ftrs[board.step, 1:  1 + PLAYERS], # prior halite score
-            (self._best_ship_actions==5).sum()) # ships converted
+        self._reward_engine.compute_ship_rewards(
+            new_board, 
+            board, 
+            self._ship_rewards, 
+            self._non_terminal_ships)
+        
+        self._reward_engine.compute_shipyard_rewards(
+            new_board, 
+            board, 
+            self._shipyard_rewards, 
+            self._non_terminal_shipyards)
+        
+        self._Q_ships_next[:ship_count].add_(self._ship_rewards[:ship_count])
+        self._Q_shipyards_next[:shipyard_count].add_(self._shipyard_rewards[:shipyard_count])
         
         new_ship_count = len(new_board.current_player.ships)
-        new_shipyard_count =len(new_board.current_player.shipyards)
+        new_shipyard_count = len(new_board.current_player.shipyards)
         with torch.no_grad():
             if new_ship_count > 0:
                 Q_ships_next = self._ship_model(
                     self._geometric_ship_ftrs_v2[1, :new_ship_count], 
                     self._ts_ftrs_v2[1, :new_ship_count])
-                Q_ships_next.add_(GAMMA*reward)
+                
+                self._Q_ships_next[self._non_terminal_ships][:ship_count].add_(Q_ships_next.max(dim=1).values)
+                
             if new_shipyard_count > 0:
                 Q_shipyards_next = self._shipyard_model(
                     self._geometric_shipyard_ftrs_v2[1, :new_shipyard_count], 
                     self._ts_ftrs_v2[1, :new_shipyard_count])
-                Q_shipyards_next.add_(GAMMA*reward)
-        
-        Q_sum_next = 0
-        if new_ship_count > 0:
-            retmax = Q_ships_next.max(dim=1)
-            Q_sum_next += retmax.values.sum().item()
-        if shipyard_count > 0:
-            retmax = Q_shipyards_current.max(dim=1)
-            Q_sum_next += retmax.values.sum().item()
-            
-        if new_ship_count > 0:
+                
+                self._Q_shipyards_next[self._non_terminal_shipyards][:shipyard_count].add_(Q_shipyards_next.max(dim=1).values)
+                    
+        if ship_count > 0:
             self._agent_manager.store(
-                new_ship_count,
-                self._geometric_ship_ftrs_v2[0, :new_ship_count], 
-                Q_sum_current,
-                Q_sum_next,
+                ship_count,
+                self._geometric_ship_ftrs_v2[0, :ship_count], 
+                Q_ships_current_max,
+                self._Q_ships_next[:ship_count],
                 True)
+        
+        if shipyard_count > 0:
+            self._agent_manager.store(
+                shipyard_count,
+                self._geometric_shipyard_ftrs_v2[0, :shipyard_count], 
+                Q_shipyards_current_max,
+                self._Q_shipyards_next[:shipyard_count],
+                False)
             
+        if self._agent_manager.total_episodes_seen + self._agent_manager.in_game_episodes_seen > TRAIN_BATCH_SIZE:
             geo_ship_ftrs, ts_ftrs_ship, ship_targets = \
                 self._agent_manager.priority_sample(TRAIN_BATCH_SIZE, True)
             
@@ -617,15 +648,7 @@ class ActionSelector:
                 ts_ftrs_ship, 
                 ship_targets,
                 board.step)
-        
-        if new_shipyard_count > 0:
-            self._agent_manager.store(
-                new_shipyard_count,
-                self._geometric_shipyard_ftrs_v2[0, :new_shipyard_count], 
-                Q_sum_current,
-                Q_sum_next,
-                False)
-            
+                    
             geo_shipyards_ftrs, ts_ftrs_shipyard, shipyards_targets = \
                 self._agent_manager.priority_sample(TRAIN_BATCH_SIZE, False)
             
@@ -638,9 +661,7 @@ class ActionSelector:
                 ts_ftrs_shipyard, 
                 shipyards_targets,
                 board.step)
-        
-        return reward
-            
+                    
     def get_action_space(self, board):
         ship_count = len(board.current_player.ships)
         shipyard_count = len(board.current_player.shipyards)
@@ -710,128 +731,71 @@ class RewardEngine:
         cls.reward_step = 1 / EPISODE_STEPS
         
     def __init__(self):
-        self._ships = {}
-        pass
-    
-    def compute_total_reward(
-        self,
-        current_board, 
-        prior_board, 
-        current_halite_cargo,
-        diff_halite_cargo,
-        current_deposited_halite, 
-        prior_deposited_halite,
-        ships_converted):
+        self._prior_ships_dict = {}
+        self._prior_ships_set = set()
+        self._prior_shipyards_dict = {}
+        self._prior_shipyards_set = set()
         
-        if current_board.step==0: return 0
-        
-        steps_remaining = EPISODE_STEPS - prior_board.step
-        prior_player = prior_board.current_player
-        current_player = current_board.current_player
-        try:
-            halite_cargo_reward = (diff_halite_cargo * 
-                                   self.mined_reward_weights).sum().item()
-        except Exception as e:
-            raise e
-    #     print(diff_halite_cargo, file=sys.__stdout__)
-        halite_deposited_score_diff = (max(current_deposited_halite) - current_deposited_halite[0]).item()
-        halite_cargo_score_diff = (max(current_halite_cargo) - current_halite_cargo[0]).item()
-        
-        halite_deposited_reward = current_deposited_halite[0] - prior_deposited_halite[0]#max(0,(current_deposited_halite[0] - prior_deposited_halite[0]).item())
-        self._ships
-        prior_ships_set = set([ship.id for ship in prior_player.ships])
-        current_ships_set = set([ship.id for ship in current_player.ships])
-        prior_shipyards_set = set([shipyard.id for shipyard in prior_player.shipyards])
-        current_shipyards_set = set([shipyard.id for shipyard in current_player.shipyards])
-        
-        my_ships_lost_from_collision = max(0, len(prior_ships_set.difference(current_ships_set)) - ships_converted)
-        my_shipyards_lost_from_collision = len(prior_shipyards_set.difference(current_shipyards_set))
-        
-        my_ships_built = len(current_ships_set.difference(prior_ships_set))
-    #     my_shipyards_built = len(current_shipyards_set.difference(prior_shipyards_set))
-    #     
-    #     reward = (halite_deposited_score_diff*-1 +
-    #               halite_cargo_score_diff*-1 +
-    #               halite_deposited_reward*1 +
-    #               halite_cargo_reward*1 + 
-    #               my_ships_lost_from_collision*-750 +
-    #               my_shipyards_lost_from_collision*-750)
-    #               my_ships_built*500 +
-    #               my_shipyards_built*500)
-        
-        ships_intersection = prior_ships_set.intersection(current_ships_set)
-        inactive_ships = 0
-        inactive_shipyards = 0
-        for ship_id in ships_intersection:
-            prior_ship = prior_board.ships[ship_id]
-            if prior_ship.next_action == None:
-                current_ship = current_board.ships[ship_id]
-                if current_ship.halite == prior_ship.halite:
-                    inactive_ships += 1
-        
-        # condition for enabling inactivity check on shipyards
-        if len(prior_player.shipyards) > len(prior_player.ships):
-            shipyards_intersection = prior_shipyards_set.intersection(current_shipyards_set)
-            for shipyard_id in shipyards_intersection:
-                prior_shipyard = prior_board.shipyards[shipyard_id]
-                if prior_shipyard.next_action == None:
-                    inactive_shipyards += 1
-                    
-        return (
-            max(0,diff_halite_cargo[0].item()) + 
-            halite_deposited_reward*(.5 + current_board.step*self.reward_step) + 
-            my_ships_lost_from_collision*-750 +
-            my_shipyards_lost_from_collision*-750 +
-            my_ships_built*500 +
-            inactive_shipyards*-25)
-    
     def update_player_ships(self, board):
         self._ships = {ship.id : ship for ship in board.current_player.ships}
         
-    def compute_ship_reward(
-        self,
-        current_board, 
-        prior_board, 
-        ship_id,
-        current_halite_cargo,
-        diff_halite_cargo,
-        current_deposited_halite, 
-        prior_deposited_halite,
-        ships_converted):
-        
-        if current_board.step==0: return 0
-        
-        rewards = {sid:0 for sid in self._prior_ships_set}
-        
-        prior_player = prior_board.current_player
+    def compute_ship_rewards(self, current_board, prior_board, ship_rewards, non_terminal_ships):
         current_player = current_board.current_player
+        prior_player = prior_board.current_player
+        if current_board.step==1:
+            self._prior_ships_set = set([ship.id for ship in prior_player.ships])
+            self._prior_ships_dict = {sid: prior_board.ships[sid] for sid in self._prior_ships_set}
+        
+        
+        my_ship_ids = {ship.id:i for i, ship in enumerate(prior_player.ships)}
         
         current_ships_set = set([ship.id for ship in current_player.ships])
         current_halite_cargo = {ship.id: ship.halite for ship in current_player.ships}
-                
-        my_ships_lost_from_collision = self._prior_ships_set.difference(ships_converted).difference(current_ships_set)
-        rewards.update({sid: -750 for sid in my_ships_lost_from_collision})
+        ships_converted = set([ship.id for ship in prior_player.ships if ship.next_action==ShipAction.CONVERT])
+        ships_lost_from_collision = self._prior_ships_set.difference(ships_converted).difference(current_ships_set)
+        
         retained_ships = current_ships_set.intersection(self._prior_ships_set)
+        deposit_weight = (.5 + current_board.step*self.reward_step)
         
-        diff_halite_cargo = {ship.id: 
-            max(0, current_halite_cargo[ship.id] - ship.halite) 
+        non_terminal_ships[[my_ship_ids[sid] for sid in ships_converted.union(ships_lost_from_collision)]] = 0
+        
+        rewards = {ship.id: 
+            max(0, current_halite_cargo[ship.id] - ship.halite) + # diff halite cargo
+            (ship.halite - current_halite_cargo[ship.id])*deposit_weight + # diff halite deposited
+            ship.halite==current_halite_cargo[ship.id]*-25 # inactivity
             if ship.id in retained_ships else 0 
-            for ship in self._prior_halite_cargo}
+            for ship in self._prior_ships_dict.values()}
+        rewards.update({sid: -500*deposit_weight for sid in ships_converted})
+        rewards.update({sid: -750 for sid in ships_lost_from_collision})
         
-        diff_halite_deposited = {ship.id: 
-            ship.halite - current_halite_cargo[ship.id]  
-            if ship.id in retained_ships else 0 
-            for ship in self._prior_halite_cargo}
-        
-        inactivity = {ship.id:
-            ship.halite==current_halite_cargo[ship.id]
-            if ship.id in retained_ships else 0
-            for ship in self._prior_halite_cargo}
-        
+        ship_rewards[:len(self._prior_ships_set)] = torch.tensor(list(rewards.values()), dtype=torch.float)     
+        ship_rewards[:len(self._prior_ships_set)].mul_(GAMMA)
         self._prior_ships_set = current_ships_set
-        self._prior_halite_cargo = current_halite_cargo
+        self._prior_ships_dict = {sid: current_board.ships[sid] for sid in current_ships_set}
+    
+    def compute_shipyard_rewards(self, current_board, prior_board, shipyard_rewards, non_terminal_shipyards):
+        current_player = current_board.current_player
+        prior_player = prior_board.current_player
         
-
+        my_shipyard_ids = {shipyard.id:i for i, shipyard in enumerate(prior_player.shipyards)}
+        current_shipyards_set = set([shipyard.id for shipyard in current_player.shipyards])
+        shipyards_lost_from_collision = self._prior_shipyards_set.difference(current_shipyards_set)
+        non_terminal_shipyards[[my_shipyard_ids[sid] for sid in shipyards_lost_from_collision]] = 0
+        
+        rewards = {shipyard.id: 
+           (shipyard.next_action==ShipyardAction.SPAWN)*500 +
+           (shipyard.next_action==None)*(-50*(1-current_board.step*self.reward_step))
+           for shipyard in self._prior_shipyards_dict.values()}
+        shipyard_rewards[:len(self._prior_shipyards_set)] = torch.tensor(list(rewards.values()), dtype=torch.float)
+        shipyard_rewards[:len(self._prior_shipyards_set)].mul_(GAMMA)
+        
+        self._prior_shipyards_set = current_shipyards_set
+        self._prior_shipyards_dict = {sid: current_board.shipyards[sid] for sid in current_shipyards_set}
+        
+        
+RewardEngine.init_weights()
+    
+    
 def agent(obs, config):
     global agent_managers
     current_board = Board(obs, config)
@@ -844,27 +808,27 @@ def agent(obs, config):
     epsilon = max(EGREEDY_LOWER_BOUND, EGREEDY*((1-EGREEDY_DECAY)**asm.ship_model.trained_examples))
     randomize = np.random.rand() < epsilon
     
-    if PRINT_STATEMENTS:
-        reward = compute_reward(
-            current_board, 
-            asm.prior_board, 
-            asm.current_ship_cargo,
-            asm._ts_ftrs[ftr_index, -PLAYERS: ],
-            asm._ts_ftrs[ftr_index, 1:  1 + PLAYERS], 
-            None if step==0 else asm._ts_ftrs[ftr_index-1, 1:  1 + PLAYERS],
-            asm.prior_ships_converted)
-        
-        print("board step:", 
-              step, 
-              ",realized reward:", 
-              reward, 
-              ",epsilon:",
-              epsilon,
-              "randomize:",
-              randomize,
-              "action_space",
-              asm.action_selector.get_action_space(current_board),
-              file=sys.__stdout__)
+#     if PRINT_STATEMENTS:
+#         reward = compute_reward(
+#             current_board, 
+#             asm.prior_board, 
+#             asm.current_ship_cargo,
+#             asm._ts_ftrs[ftr_index, -PLAYERS: ],
+#             asm._ts_ftrs[ftr_index, 1:  1 + PLAYERS], 
+#             None if step==0 else asm._ts_ftrs[ftr_index-1, 1:  1 + PLAYERS],
+#             asm.prior_ships_converted)
+#         
+#         print("board step:", 
+#               step, 
+#               ",realized reward:", 
+#               reward, 
+#               ",epsilon:",
+#               epsilon,
+#               "randomize:",
+#               randomize,
+#               "action_space",
+#               asm.action_selector.get_action_space(current_board),
+#               file=sys.__stdout__)
     
     if randomize:
         ships_converted = randomize_action(current_board)
