@@ -33,7 +33,7 @@ EGREEDY_DECAY = 0.0001
 GAME_BATCH_SIZE = 1
 TRAIN_BATCH_SIZE = 48
 LEARNING_RATE = 0.01
-CHANNELS = 2
+CHANNELS = 1
 MOMENTUM  = 0.9
 EPOCHS = 1
 MAX_ACTION_SPACE = 50
@@ -488,10 +488,24 @@ def update_tensors_v2(
              range(0, len(halite), BOARD_SIZE)], 
             dtype=torch.float) 
     
+    current_ship_cargo[0] = sum([ship.halite for ship in cp.ships])
+    
+    if current_ship_cargo[0] > 0:
+        for my_shipyard in cp.shipyards:
+            halite_tensor[ 
+                BOARD_SIZE - my_shipyard.position.y - 1, 
+                my_shipyard.position.x] = current_ship_cargo[0]
+    
+    diff = halite_tensor.max() - halite_tensor.min()
+    halite_tensor.sub_(halite_tensor.min())
+    halite_tensor.div_(diff) 
+    halite_tensor.mul_(2)
+    halite_tensor.sub_(1)
+        
     if len(cp.ships)>0:        
         geometric_ship_ftrs[:, 0] = halite_tensor
         geometric_shipyard_ftrs[:, 0] = halite_tensor
-        geometric_shipyard_ftrs[:, 1] = halite_tensor
+#         geometric_shipyard_ftrs[:, 1] = halite_tensor
     
         for i, my_ship in enumerate(cp.ships):
             heat = distance.cdist(
@@ -507,15 +521,21 @@ def update_tensors_v2(
             heat_tensor = torch.as_tensor(heat, dtype=torch.float)
             flipped = torch.flip(heat_tensor, dims=(0,))
             torch.mul(geometric_ship_ftrs[i, 0], flipped, out=geometric_ship_ftrs[i, 0])
-                                            
-            geometric_ship_ftrs[i, 1] = flipped
+            shift = (BOARD_SIZE//2 - my_ship.position.x, my_ship.position.y - BOARD_SIZE//2) 
+            
+            geometric_ship_ftrs[i, 0] = torch.roll(
+                geometric_ship_ftrs[i, 0], 
+                shifts=(shift[0], shift[1]), 
+                dims=(1,0))
+            
+#             geometric_ship_ftrs[i, 1] = flipped
                                 
-            current_ship_cargo[0] += my_ship.halite
+#             current_ship_cargo[0] += my_ship.halite
         
         # have to do this after since it will get affected by the flip multiplication
-        for i, my_ship in enumerate(cp.ships):
-            geometric_ship_ftrs[[j for j in range(len(cp.ships)) if j!= i], 0, 
-                BOARD_SIZE - my_ship.position.y - 1, my_ship.position.x] = -500
+#         for i, my_ship in enumerate(cp.ships):
+#             geometric_ship_ftrs[[j for j in range(len(cp.ships)) if j!= i], 0, 
+#                 BOARD_SIZE - my_ship.position.y - 1, my_ship.position.x] = -500
                 
     if len(cp.shipyards)>0:
         np.divide(1, fleet_heat, out=fleet_heat)
@@ -531,15 +551,18 @@ def update_tensors_v2(
             np.divide(1, heat, out=heat)
             
             flipped = torch.flip(torch.as_tensor(heat, dtype=torch.float), dims=(0,))
+            
             torch.mul(remaining, flipped, out=flipped)
             torch.mul(halite_tensor, flipped, out=geometric_shipyard_ftrs[i, 0])
             
-            geometric_ship_ftrs[:, 0, BOARD_SIZE - my_shipyard.position.y - 1, my_shipyard.position.x] = max(100, current_ship_cargo[0])
-    
-    geometric_ship_ftrs[:, 0] = halite_tensor
-    geometric_shipyard_ftrs[:, 0] = halite_tensor
-    geometric_shipyard_ftrs[:, 1] = halite_tensor
-        
+            shift = (BOARD_SIZE//2 - my_shipyard.position.x, my_shipyard.position.y - BOARD_SIZE//2) 
+            
+            geometric_shipyard_ftrs[i, 0] = torch.roll(
+                geometric_shipyard_ftrs[i, 0], 
+                shifts=(shift[0], shift[1]), 
+                dims=(1,0))
+            
+            
     ts_ftrs[:, 1] = cp.halite
     for i, enemy in enumerate(board.opponents):
         ts_ftrs[:, 2 + i] = enemy.halite
@@ -834,8 +857,8 @@ class RewardEngine:
         
         rewards = {ship.id: 
             max(0, current_halite_cargo[ship.id] - ship.halite)*10 + # diff halite cargo
-            max(0, ship.halite - current_halite_cargo[ship.id])*deposit_weight  # diff halite deposited
-#             int(ship.halite==current_halite_cargo[ship.id] and ship.next_action==None)*-25 # inactivity
+            max(0, ship.halite - current_halite_cargo[ship.id])*deposit_weight + # diff halite deposited
+            int(ship.halite==current_halite_cargo[ship.id] and ship.next_action==None)*-5 # inactivity
             if ship.id in retained_ships else 0 
             for ship in prior_ships_dict.values()}
         rewards.update({sid: -500*deposit_weight for sid in ships_converted})
