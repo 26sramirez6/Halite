@@ -382,6 +382,7 @@ class DQN(nn.Module):
     def reset_noise(self):
         for noisy_layer in self._fc_layers:
             noisy_layer.reset_noise()
+        self._final_layer.reset_noise()
             
     def forward(self, geometric_x, ts_x):
         y = self._conv_layers[0](geometric_x)
@@ -622,8 +623,8 @@ class ActionSelector:
             shipyard_count, 
             current_halite):
         
-        self._ship_model.eval()
-        self._shipyard_model.eval()
+#         self._ship_model.eval()
+#         self._shipyard_model.eval()
         self._best_ship_actions.fill(0)
         self._best_shipyard_actions.fill(0)
         self._Q_ships_current_adj.zero_()
@@ -832,9 +833,9 @@ class RewardEngine:
         non_terminal_ships[[my_ship_ids[sid] for sid in ships_converted.union(ships_lost_from_collision)]] = 0
         
         rewards = {ship.id: 
-            max(0, current_halite_cargo[ship.id] - ship.halite) + # diff halite cargo
-            max(0, ship.halite - current_halite_cargo[ship.id])*deposit_weight  +# diff halite deposited
-            int(ship.halite==current_halite_cargo[ship.id] and ship.next_action==None)*-25 # inactivity
+            max(0, current_halite_cargo[ship.id] - ship.halite)*10 + # diff halite cargo
+            max(0, ship.halite - current_halite_cargo[ship.id])*deposit_weight  # diff halite deposited
+#             int(ship.halite==current_halite_cargo[ship.id] and ship.next_action==None)*-25 # inactivity
             if ship.id in retained_ships else 0 
             for ship in prior_ships_dict.values()}
         rewards.update({sid: -500*deposit_weight for sid in ships_converted})
