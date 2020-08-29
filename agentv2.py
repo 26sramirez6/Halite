@@ -645,9 +645,10 @@ class ActionSelector:
             ship_count, 
             shipyard_count, 
             current_halite):
-        
-#         self._ship_model.eval()
-#         self._shipyard_model.eval()
+        if not TRAIN_MODELS:
+            self._ship_model.eval()
+            self._shipyard_model.eval()
+            
         self._best_ship_actions.fill(0)
         self._best_shipyard_actions.fill(0)
         self._Q_ships_current_adj.zero_()
@@ -761,7 +762,7 @@ class ActionSelector:
                 Q_shipyards_current_max,
                 self._Q_shipyards_next[:shipyard_count],
                 False)
-        if self._agent_manager.ship_model_samples > TRAIN_BATCH_SIZE:
+        if TRAIN_MODELS and self._agent_manager.ship_model_samples > TRAIN_BATCH_SIZE:
             geo_ship_ftrs, ts_ftrs_ship, ship_targets = self._agent_manager.priority_sample(TRAIN_BATCH_SIZE, True)
             
             train_model(
@@ -773,7 +774,7 @@ class ActionSelector:
                 ship_targets,
                 board.step)
         
-        if self._agent_manager.shipyard_model_samples > TRAIN_BATCH_SIZE:
+        if TRAIN_MODELS and self._agent_manager.shipyard_model_samples > TRAIN_BATCH_SIZE:
             geo_shipyards_ftrs, ts_ftrs_shipyard, shipyards_targets = self._agent_manager.priority_sample(TRAIN_BATCH_SIZE, False)
             
             train_model(
@@ -863,7 +864,7 @@ class RewardEngine:
             for ship in prior_ships_dict.values()}
         rewards.update({sid: -500*deposit_weight for sid in ships_converted})
         rewards.update({sid: -750 for sid in ships_lost_from_collision})
-        
+        rewards = {sid: v*(1-self.reward_step*current_board.step) for sid, v in rewards.items()}
         ship_rewards[:prior_ship_count] = torch.tensor(list(rewards.values()), dtype=torch.float)     
 #         self._prior_ships_set = current_ships_set
 #         self._prior_ships_dict = {sid: current_board.ships[sid] for sid in current_ships_set}
@@ -881,8 +882,9 @@ class RewardEngine:
         
         rewards = {shipyard.id: 
            int(shipyard.next_action==ShipyardAction.SPAWN)*500 +
-           int(shipyard.next_action==None)*(-50*(1-current_board.step*self.reward_step))
+           int(shipyard.next_action==None)*-50
            for shipyard in prior_shipyards_dict.values()}
+        rewards = {sid: v*(1-self.reward_step*current_board.step) for sid, v in rewards.items()}
         shipyard_rewards[:prior_shipyard_count] = torch.tensor(list(rewards.values()), dtype=torch.float)
         
 #         self._prior_shipyards_set = current_shipyards_set
@@ -899,6 +901,7 @@ RewardEngine.init_weights()
     
 def agent(obs, config):
     global agent_managers
+    sys.stdout = sys.__stdout__
     current_board = Board(obs, config)
     asm = agent_managers.get(current_board.current_player.id)
     step = current_board.step        
