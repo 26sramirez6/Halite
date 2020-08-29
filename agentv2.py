@@ -31,7 +31,7 @@ EGREEDY = 0
 EGREEDY_LOWER_BOUND = 0
 EGREEDY_DECAY = 0.0001
 GAME_BATCH_SIZE = 1
-TRAIN_BATCH_SIZE = 48
+TRAIN_BATCH_SIZE = 16
 LEARNING_RATE = 0.01
 CHANNELS = 1
 MOMENTUM  = 0.9
@@ -73,7 +73,9 @@ class AgentStateManager:
         self.ship_model = ship_model
         self.shipyard_model = shipyard_model
         self.ship_model_samples = 0
+        self._ship_losses_stored = 0
         self.shipyard_model_samples = 0
+        self._shipyard_losses_stored = 0
         self.total_episodes_seen = 0
         self.in_game_episodes_seen = 0
         self._ship_buffer_filled = False
@@ -129,9 +131,17 @@ class AgentStateManager:
             dtype=torch.float).to(DEVICE) #@UndefinedVariable
         
         self.episode_rewards = torch.zeros(
-            MAX_EPISODES_MEMORY, 
+            EPISODE_STEPS, 
             dtype=torch.float).to(DEVICE) #@UndefinedVariable
         
+        self.ship_losses = torch.zeros(
+            EPISODE_STEPS, 
+            dtype=torch.float).to(DEVICE) #@UndefinedVariable
+            
+        self.shipyard_losses = torch.zeros(
+            EPISODE_STEPS, 
+            dtype=torch.float).to(DEVICE) #@UndefinedVariable
+            
         self.action_selector = ActionSelector(
             self, 
             ship_model, 
@@ -148,6 +158,8 @@ class AgentStateManager:
         self.action_selector.reset_state()
         self.total_episodes_seen += self.in_game_episodes_seen
         self.in_game_episodes_seen = 0
+        self._ship_losses_stored = 0
+        self._shipyard_losses_stored = 0
         if self.total_episodes_seen + EPISODE_STEPS > MAX_EPISODES_MEMORY:
             self.total_episodes_seen = 0
         
@@ -156,8 +168,7 @@ class AgentStateManager:
         self.action_selector.set_prior_ship_cargo(prior_ship_cargo)
     
     def compute_total_reward_post_game(self):
-        return self.episode_rewards[self.total_episodes_seen: 
-            self.total_episodes_seen + self.in_game_episodes_seen].sum().item()
+        return self.episode_rewards.sum().item()
     
     def priority_sample(self, batch_size, is_ship_model):
         if is_ship_model:
@@ -192,6 +203,14 @@ class AgentStateManager:
             return (self._geo_shipyard_ftrs[shipyard_idxs], 
                     self._ts_shipyard_ftrs[shipyard_idxs], 
                     self._target_Q_shipyard[shipyard_idxs])       
+    
+    def save_loss(self, loss, is_ship_model):
+        if is_ship_model:
+            self.ship_losses[self._ship_losses_stored] = loss
+            self._ship_losses_stored += 1
+        else:
+            self.shipyard_losses[self._shipyard_losses_stored] = loss
+            self._shipyard_losses_stored += 1
         
     def store(self,
         count,
@@ -772,7 +791,8 @@ class ActionSelector:
                 geo_ship_ftrs, 
                 ts_ftrs_ship, 
                 ship_targets,
-                board.step)
+                self._agent_manager,
+                True)
         
         if TRAIN_MODELS and self._agent_manager.shipyard_model_samples > TRAIN_BATCH_SIZE:
             geo_shipyards_ftrs, ts_ftrs_shipyard, shipyards_targets = self._agent_manager.priority_sample(TRAIN_BATCH_SIZE, False)
@@ -784,7 +804,9 @@ class ActionSelector:
                 geo_shipyards_ftrs, 
                 ts_ftrs_shipyard, 
                 shipyards_targets,
-                board.step)
+                self._agent_manager,
+                False)
+            
         self._ship_model.reset_noise()
         self._shipyard_model.reset_noise()
                     
@@ -815,15 +837,14 @@ class ActionSelector:
         torch.save(self._shipyard_model.state_dict(), "{0}/{1}_{0}.nn".format(TIMESTAMP, "shipyard_dqn"))
         
 
-def train_model(model, criterion, optimizer, geo_ftrs, ts_ftrs, labels, step):
+def train_model(model, criterion, optimizer, geo_ftrs, ts_ftrs, labels, asm, is_ship_model):
     model.train()
-    for e in range(EPOCHS):
-        y_pred = model(geo_ftrs, ts_ftrs)
-        loss = criterion(y_pred.max(dim=1).values, labels)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-#         print("Epoch {}, Board step {}, Train batch loss: {}".format(e, step, loss.item()), file=sys.__stdout__)
+    y_pred = model(geo_ftrs, ts_ftrs)
+    loss = criterion(y_pred.max(dim=1).values, labels)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    asm.save_loss(loss.item(), is_ship_model)
 
 
 class RewardEngine:
@@ -916,7 +937,7 @@ def agent(obs, config):
           ",shipyard reward",
           shipyard_reward,
           file=sys.__stdout__)
-    asm.episode_rewards[asm.in_game_episodes_seen + asm.total_episodes_seen] = (
+    asm.episode_rewards[asm.in_game_episodes_seen] = (
         ship_reward.sum().item() + shipyard_reward.sum().item())
     
     asm.set_prior_board(current_board)
@@ -930,7 +951,15 @@ class Outputter:
         self._all_rewards = torch.zeros(
             0, 
             dtype=torch.float).to(DEVICE) #@UndefinedVariable
-    
+        
+        self._ship_losses = torch.zeros(
+            0, 
+            dtype=torch.float).to(DEVICE) #@UndefinedVariable
+        
+        self._shipyard_losses = torch.zeros(
+            0, 
+            dtype=torch.float).to(DEVICE) #@UndefinedVariable
+            
     def _moving_average(self, a, n) :
         ret = np.cumsum(a, dtype=float)
         ret[n:] = ret[n:] - ret[:-n]
@@ -939,17 +968,23 @@ class Outputter:
     def output_logs(self, agent_managers, game_id):        
         append_p = ""
         for asm in agent_managers.values():
-            self._all_rewards = torch.cat((self._all_rewards, asm.episode_rewards[asm.total_episodes_seen:
-                asm.total_episodes_seen+asm.in_game_episodes_seen]))        
-    
-        fig, ax = plt.subplots()
+            self._all_rewards = torch.cat((self._all_rewards, asm.episode_rewards))        
+            self._ship_losses = torch.cat((self._ship_losses, asm.ship_losses))  
+            self._shipyard_losses = torch.cat((self._shipyard_losses, asm.shipyard_losses)) 
+            
+        fig, axis = plt.subplots(1, 2)
         arr = np.array(self._all_rewards)
         ma_len = 100
         ma = self._moving_average(arr, ma_len)
-        ax.plot(range(len(arr)), arr, label="Step Reward")
-        ax.plot(range(ma_len,len(ma)+ma_len), ma, label="MA")
-        legend = ax.legend()
-        ax.grid()
+        axis[0].plot(range(len(arr)), arr, label="Step Reward")
+        axis[0].plot(range(ma_len,len(ma)+ma_len), ma, label="MA")
+        
+        axis[1].plot(range(len(self._ship_losses)), np.array(self._ship_losses), label="Ship Model Loss", color="red")
+        
+        axis[0].legend()
+        axis[1].legend()
+        axis[0].grid()
+        axis[1].grid()
         fig.savefig("{0}/rewards.png".format(TIMESTAMP))
         
         with open("{0}/{1}_{0}g{2}.html".format(TIMESTAMP, append_p, game_id), "w") as f:
