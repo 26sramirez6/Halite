@@ -27,15 +27,11 @@ STARTING = 5000
 BOARD_SIZE = 21
 PLAYERS = 4
 GAMMA = 0.6
-EGREEDY = 0
-EGREEDY_LOWER_BOUND = 0
-EGREEDY_DECAY = 0.0001
-GAME_BATCH_SIZE = 1
 TRAIN_BATCH_SIZE = 16
+TARGET_MODEL_UPDATE = 16
 LEARNING_RATE = 0.01
 CHANNELS = 1
 MOMENTUM  = 0.9
-EPOCHS = 1
 MAX_ACTION_SPACE = 50
 WEIGHT_DECAY = 5e-4
 SHIPYARD_ACTIONS = [None, ShipyardAction.SPAWN]
@@ -57,9 +53,11 @@ if RANDOM_SEED > -1:
 
 class AgentStateManager:        
     def __init__(self, 
-            player_id,
-            ship_model, 
-            shipyard_model, 
+            player_id,        
+            ship_cur_model, 
+            shipyard_cur_model,
+            ship_tar_model, 
+            shipyard_tar_model, 
             ship_model_criterion, 
             shipyard_model_criterion, 
             ship_model_optimizer, 
@@ -70,8 +68,15 @@ class AgentStateManager:
         self.prior_board = None
         self.prior_ships_converted = 0
         self._alpha = 0.2
-        self.ship_model = ship_model
-        self.shipyard_model = shipyard_model
+        self.ship_cur_model = ship_cur_model
+        self.shipyard_cur_model = shipyard_cur_model
+        self.ship_tar_model = ship_tar_model
+        self.shipyard_tar_model = shipyard_tar_model
+        self.ship_model_criterion = ship_model_criterion
+        self.shipyard_model_criterion = shipyard_model_criterion 
+        self.ship_model_optimizer = ship_model_optimizer
+        self.shipyard_model_optimizer = shipyard_model_optimizer
+        
         self.ship_model_samples = 0
         self._ship_losses_stored = 0
         self.shipyard_model_samples = 0
@@ -142,14 +147,7 @@ class AgentStateManager:
             EPISODE_STEPS, 
             dtype=torch.float).to(DEVICE) #@UndefinedVariable
             
-        self.action_selector = ActionSelector(
-            self, 
-            ship_model, 
-            shipyard_model, 
-            ship_model_criterion, 
-            shipyard_model_criterion, 
-            ship_model_optimizer, 
-            shipyard_model_optimizer)     
+        self.action_selector = ActionSelector(self)     
     
     def set_prior_board(self, prior_board):
         self.prior_board = prior_board
@@ -162,7 +160,9 @@ class AgentStateManager:
         self._shipyard_losses_stored = 0
         if self.total_episodes_seen + EPISODE_STEPS > MAX_EPISODES_MEMORY:
             self.total_episodes_seen = 0
-        
+        torch.save(self.ship_tar_model.state_dict(), "{0}/{1}_{0}.nn".format(TIMESTAMP, "ship_dqn"))
+        torch.save(self.shipyard_tar_model.state_dict(), "{0}/{1}_{0}.nn".format(TIMESTAMP, "shipyard_dqn"))
+            
     def set_prior_ship_cargo(self, prior_ship_cargo):
         self.prior_ship_cargo.copy_(prior_ship_cargo)
         self.action_selector.set_prior_ship_cargo(prior_ship_cargo)
@@ -204,6 +204,54 @@ class AgentStateManager:
                     self._ts_shipyard_ftrs[shipyard_idxs], 
                     self._target_Q_shipyard[shipyard_idxs])       
     
+    def train_current_models(self):
+        if self.ship_model_samples > TRAIN_BATCH_SIZE:
+            geo_ship_ftrs, ts_ftrs_ship, ship_targets = self.priority_sample(TRAIN_BATCH_SIZE, True)
+            
+            mini_batch_loss = self.train_model(
+                self.ship_cur_model, 
+                self.ship_model_criterion, 
+                self.ship_model_optimizer, 
+                geo_ship_ftrs, 
+                ts_ftrs_ship, 
+                ship_targets)
+            
+            self.save_loss(mini_batch_loss, True)
+            
+        if self.shipyard_model_samples > TRAIN_BATCH_SIZE:
+            geo_shipyards_ftrs, ts_ftrs_shipyard, shipyards_targets = self.priority_sample(TRAIN_BATCH_SIZE, False)
+            
+            mini_batch_loss = self.train_model(
+                self.shipyard_cur_model, 
+                self.shipyard_model_criterion,
+                self.shipyard_model_optimizer,
+                geo_shipyards_ftrs, 
+                ts_ftrs_shipyard, 
+                shipyards_targets)
+            
+            self.save_loss(mini_batch_loss, False)
+            
+        self.ship_cur_model.reset_noise()
+        self.shipyard_cur_model.reset_noise()
+        
+        if self.ship_model_samples > 0 and self.ship_model_samples % TARGET_MODEL_UPDATE == 0:
+            self.update_target_model(self.ship_cur_model, self.ship_tar_model)
+        
+        if self.shipyard_model_samples > 0 and self.shipyard_model_samples % TARGET_MODEL_UPDATE == 0:
+            self.update_target_model(self.shipyard_cur_model, self.shipyard_tar_model)
+        
+    def update_target_model(self, current_model, target_model):
+        target_model.load_state_dict(current_model.state_dict())
+        
+    def train_model(self, model, criterion, optimizer, geo_ftrs, ts_ftrs, targets):
+        model.train()
+        y_pred = model(geo_ftrs, ts_ftrs)
+        loss = criterion(y_pred.max(dim=1).values, targets)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        return loss.item()
+        
     def save_loss(self, loss, is_ship_model):
         if is_ship_model:
             self.ship_losses[self._ship_losses_stored] = loss
@@ -285,7 +333,7 @@ def timer(func):
     return wrapper_timer
 
 class NoisyLinear(nn.Module):
-    def __init__(self, in_features, out_features, std_init=0.1):
+    def __init__(self, in_features, out_features, std_init=0.01):
         super(NoisyLinear, self).__init__()
         
         self.in_features  = in_features
@@ -591,22 +639,9 @@ def update_tensors_v2(
     return
 
 class ActionSelector:
-    def __init__(self, 
-            agent_manager,
-            ship_model, 
-            shipyard_model, 
-            ship_model_criterion,
-            shipyard_model_criterion,
-            ship_model_optimizer,
-            shipyard_model_optimizer):
+    def __init__(self, agent_manager):
         
         self._agent_manager = agent_manager
-        self._ship_model = ship_model
-        self._shipyard_model = shipyard_model
-        self._ship_model_criterion = ship_model_criterion
-        self._shipyard_model_criterion = shipyard_model_criterion
-        self._ship_model_optimizer = ship_model_optimizer
-        self._shipyard_model_optimizer = shipyard_model_optimizer
         self._reward_engine = RewardEngine()
         
         self._prior_ship_cargo = torch.zeros(PLAYERS, dtype=torch.float).to(DEVICE) #@UndefinedVariable
@@ -665,8 +700,10 @@ class ActionSelector:
             shipyard_count, 
             current_halite):
         if not TRAIN_MODELS:
-            self._ship_model.eval()
-            self._shipyard_model.eval()
+            self._agent_manager.ship_cur_model.eval()
+            self._agent_manager.shipyard_cur_model.eval()
+            self._agent_manager.ship_tar_model.eval()
+            self._agent_manager.shipyard_tar_model.eval()
             
         self._best_ship_actions.fill(0)
         self._best_shipyard_actions.fill(0)
@@ -691,12 +728,12 @@ class ActionSelector:
         
         with torch.no_grad():
             if ship_count > 0:
-                Q_ships_current = self._ship_model(
+                Q_ships_current = self._agent_manager.ship_cur_model(
                     self._geometric_ship_ftrs_v2[0, :ship_count], 
                     self._ts_ftrs_v2[0, :ship_count])
                 print(Q_ships_current, file=sys.__stdout__)
             if shipyard_count > 0:
-                Q_shipyards_current = self._shipyard_model(
+                Q_shipyards_current = self._agent_manager.shipyard_cur_model(
                     self._geometric_shipyard_ftrs_v2[0, :shipyard_count], 
                     self._ts_ftrs_v2[0, :shipyard_count])
         
@@ -748,18 +785,31 @@ class ActionSelector:
         
         with torch.no_grad():
             if ship_count > 0 and self._non_terminal_ships.sum() > 0:
-                Q_ships_next = self._ship_model(
+                Q_ships_next_state_cur_model = self._agent_manager.ship_cur_model(
+                    self._geometric_ship_ftrs_v2[1, :ship_count], 
+                    self._ts_ftrs_v2[1, :ship_count]).mul_(GAMMA)                
+                
+                Q_ships_next_state_tar_model = self._agent_manager.ship_tar_model(
                     self._geometric_ship_ftrs_v2[1, :ship_count], 
                     self._ts_ftrs_v2[1, :ship_count]).mul_(GAMMA)
                 
-                self._Q_ships_next.masked_scatter_(self._non_terminal_ships, Q_ships_next.max(dim=1).values)
+                Q_ships_next = Q_ships_next_state_tar_model.gather(1, Q_ships_next_state_cur_model.max(dim=1).indices.unsqueeze(1))
+                
+                self._Q_ships_next.masked_scatter_(self._non_terminal_ships, Q_ships_next)
+                
                 
             if shipyard_count > 0 and self._non_terminal_shipyards.sum() > 0:
-                Q_shipyards_next = self._shipyard_model(
+                Q_shipyards_next_state_cur_model = self._agent_manager.shipyard_cur_model(
                     self._geometric_shipyard_ftrs_v2[1, :shipyard_count], 
                     self._ts_ftrs_v2[1, :shipyard_count]).mul_(GAMMA)
                 
-                self._Q_ships_next.masked_scatter_(self._non_terminal_shipyards, Q_shipyards_next.max(dim=1).values)
+                Q_shipyards_next_state_tar_model = self._agent_manager.shipyard_tar_model(
+                    self._geometric_shipyard_ftrs_v2[1, :shipyard_count], 
+                    self._ts_ftrs_v2[1, :shipyard_count]).mul_(GAMMA)
+                
+                Q_shipyards_next = Q_shipyards_next_state_tar_model.gather(1, Q_shipyards_next_state_cur_model.max(dim=1).indices.unsqueeze(1))
+                                
+                self._Q_shipyards_next.masked_scatter_(self._non_terminal_shipyards, Q_shipyards_next)
         
         self._Q_ships_next[:ship_count].add_(self._ship_rewards[:ship_count])
         self._Q_shipyards_next[:shipyard_count].add_(self._shipyard_rewards[:shipyard_count])
@@ -781,35 +831,10 @@ class ActionSelector:
                 Q_shipyards_current_max,
                 self._Q_shipyards_next[:shipyard_count],
                 False)
-        if TRAIN_MODELS and self._agent_manager.ship_model_samples > TRAIN_BATCH_SIZE:
-            geo_ship_ftrs, ts_ftrs_ship, ship_targets = self._agent_manager.priority_sample(TRAIN_BATCH_SIZE, True)
-            
-            train_model(
-                self._ship_model, 
-                self._ship_model_criterion, 
-                self._ship_model_optimizer, 
-                geo_ship_ftrs, 
-                ts_ftrs_ship, 
-                ship_targets,
-                self._agent_manager,
-                True)
         
-        if TRAIN_MODELS and self._agent_manager.shipyard_model_samples > TRAIN_BATCH_SIZE:
-            geo_shipyards_ftrs, ts_ftrs_shipyard, shipyards_targets = self._agent_manager.priority_sample(TRAIN_BATCH_SIZE, False)
-            
-            train_model(
-                self._shipyard_model, 
-                self._shipyard_model_criterion,
-                self._shipyard_model_optimizer,
-                geo_shipyards_ftrs, 
-                ts_ftrs_shipyard, 
-                shipyards_targets,
-                self._agent_manager,
-                False)
-            
-        self._ship_model.reset_noise()
-        self._shipyard_model.reset_noise()
-                    
+        if TRAIN_MODELS:
+            self._agent_manager.train_current_models()
+                                
     def get_action_space(self, board):
         ship_count = len(board.current_player.ships)
         shipyard_count = len(board.current_player.shipyards)
@@ -833,19 +858,6 @@ class ActionSelector:
     
     def reset_state(self):
         self._reward_engine.reset_state()
-        torch.save(self._ship_model.state_dict(), "{0}/{1}_{0}.nn".format(TIMESTAMP, "ship_dqn"))
-        torch.save(self._shipyard_model.state_dict(), "{0}/{1}_{0}.nn".format(TIMESTAMP, "shipyard_dqn"))
-        
-
-def train_model(model, criterion, optimizer, geo_ftrs, ts_ftrs, labels, asm, is_ship_model):
-    model.train()
-    y_pred = model(geo_ftrs, ts_ftrs)
-    loss = criterion(y_pred.max(dim=1).values, labels)
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-    asm.save_loss(loss.item(), is_ship_model)
-
 
 class RewardEngine:
     @classmethod
@@ -1004,9 +1016,8 @@ if RANDOM_SEED > -1:
 
 i = 1
 agents = [agent]
-ship_huber = nn.SmoothL1Loss()
-shipyard_huber = nn.SmoothL1Loss()
-ship_dqn = DQN(
+
+ship_dqn_cur = DQN(
     3,  # number of conv layers
     1,  # number of fully connected layers at end
     64, # number of neurons in fully connected layers at end
@@ -1017,7 +1028,7 @@ ship_dqn = DQN(
     1,  # number of extra time series features
     6   # out nerouns
 ).to(DEVICE)  
-shipyard_dqn = DQN(
+shipyard_dqn_cur = DQN(
     3,  # number of conv layers
     1,  # number of fully connected layers at end
     64, # number of neurons in fully connected layers at end
@@ -1027,31 +1038,59 @@ shipyard_dqn = DQN(
     0,  # padding
     1,  # number of extra time series features
     2   # out nerouns
+).to(DEVICE) 
+ 
+ship_dqn_tar = DQN(
+    3,  # number of conv layers
+    1,  # number of fully connected layers at end
+    64, # number of neurons in fully connected layers at end
+    8,  # number of start filters for conv layers (depth)
+    3,  # size of kernel
+    1,  # stride of the kernel
+    0,  # padding
+    1,  # number of extra time series features
+    6   # out nerouns
 ).to(DEVICE)  
+shipyard_dqn_tar = DQN(
+    3,  # number of conv layers
+    1,  # number of fully connected layers at end
+    64, # number of neurons in fully connected layers at end
+    8,  # number of start filters for conv layers (depth)
+    3,  # size of kernel
+    1,  # stride of the kernel
+    0,  # padding
+    1,  # number of extra time series features
+    2   # out nerouns
+).to(DEVICE) 
+ 
+ship_huber = nn.SmoothL1Loss()
+shipyard_huber = nn.SmoothL1Loss()
 ship_optimizer = torch.optim.SGD( #@UndefinedVariable
-    ship_dqn.parameters(), 
+    ship_dqn_tar.parameters(), 
     lr=LEARNING_RATE,
     momentum=MOMENTUM, 
     weight_decay=WEIGHT_DECAY)
 shipyard_optimizer = torch.optim.SGD( #@UndefinedVariable
-    shipyard_dqn.parameters(), 
+    shipyard_dqn_tar.parameters(), 
     lr=LEARNING_RATE,
     momentum=MOMENTUM, 
     weight_decay=WEIGHT_DECAY)
 
 if os.path.exists("{0}/ship_dqn_{0}.nn".format(TIMESTAMP)):
-    ship_dqn.load_state_dict(torch.load("{0}/ship_dqn_{0}.nn".format(TIMESTAMP)))
+    ship_dqn_tar.load_state_dict(torch.load("{0}/ship_dqn_{0}.nn".format(TIMESTAMP)))
 if os.path.exists("{0}/shipyard_dqn_{0}.nn".format(TIMESTAMP)):
-    shipyard_dqn.load_state_dict(torch.load("{0}/shipyard_dqn_{0}.nn".format(TIMESTAMP)))
+    shipyard_dqn_tar.load_state_dict(torch.load("{0}/shipyard_dqn_{0}.nn".format(TIMESTAMP)))
 
-print("ship dqn:", ship_dqn, file=sys.__stdout__)
-print("shipyard dqn:", shipyard_dqn, file=sys.__stdout__)
+print("ship dqn:", ship_dqn_tar, file=sys.__stdout__)
+print("shipyard dqn:", shipyard_dqn_tar, file=sys.__stdout__)
 
 agent_managers = {i: 
     AgentStateManager(
         i, 
-        ship_dqn, 
-        shipyard_dqn, 
+        ship_dqn_cur, 
+        shipyard_dqn_cur,
+        ship_dqn_tar, 
+        shipyard_dqn_tar, 
         ship_huber, 
         shipyard_huber, 
         ship_optimizer, 
