@@ -24,7 +24,7 @@ EPISODE_STEPS = 50
 MAX_EPISODES_MEMORY = 500
 MAX_SHIPS = 100
 STARTING = 5000
-CONVERT_COST = 5001
+CONVERT_COST = 500
 BOARD_SIZE = 21
 PLAYERS = 4
 GAMMA = 0.6
@@ -33,7 +33,6 @@ TARGET_MODEL_UPDATE = 100
 LEARNING_RATE = 0.01
 CHANNELS = 1
 MOMENTUM  = 0.9
-MAX_ACTION_SPACE = 50
 WEIGHT_DECAY = 5e-4
 SHIPYARD_ACTIONS = [None, ShipyardAction.SPAWN]
 SHIP_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST,ShipAction.CONVERT]
@@ -140,21 +139,6 @@ class AgentStateManager:
         self._shipyard_non_terminals = torch.ones(
             MAX_EPISODES_MEMORY,
             dtype=torch.float).to(DEVICE)
-#         self._Q_ship = torch.zeros(
-#             MAX_EPISODES_MEMORY*(MAX_SHIPS),
-#             dtype=torch.float).to(DEVICE)
-#         
-#         self._Q_shipyard = torch.zeros(
-#             MAX_EPISODES_MEMORY*(MAX_SHIPS),
-#             dtype=torch.float).to(DEVICE)
-#         
-#         self._target_Q_ship = torch.zeros(
-#             MAX_EPISODES_MEMORY*(MAX_SHIPS),
-#             dtype=torch.float).to(DEVICE)
-#         
-#         self._target_Q_shipyard = torch.zeros(
-#             MAX_EPISODES_MEMORY*(MAX_SHIPS),
-#             dtype=torch.float).to(DEVICE)
 #         
 #         self._tdiffs_ship = torch.zeros(
 #             MAX_EPISODES_MEMORY,
@@ -286,7 +270,7 @@ class AgentStateManager:
             ts_ftrs_shipyard_t1, \
             shipyard_rewards, \
             shipyard_actions, \
-            non_terminals = self.priority_sample(TRAIN_BATCH_SIZE, True)
+            non_terminals = self.priority_sample(TRAIN_BATCH_SIZE, False)
         
             mini_batch_loss = AgentStateManager.train_model(
                 self.shipyard_cur_model, 
@@ -644,6 +628,13 @@ spatial = torch.tensor((
 from scipy.spatial import distance
 fleet_heat = np.full((BOARD_SIZE, BOARD_SIZE), BOARD_SIZE*2, dtype=np.float)
 player_zeros = torch.zeros(PLAYERS, dtype=torch.float).to(DEVICE) #@UndefinedVariable
+middle_heat = distance.cdist(
+    spatial, [(BOARD_SIZE//2, BOARD_SIZE//2)], 
+    metric="cityblock").reshape(BOARD_SIZE, BOARD_SIZE)
+middle_heat[BOARD_SIZE//2, BOARD_SIZE//2] = .75
+np.divide(1, middle_heat, out=middle_heat)
+middle_heat_flipped = torch.flip(torch.as_tensor(middle_heat, dtype=torch.float), dims=(0,))
+
 def update_tensors_v2(
     geometric_ship_ftrs, 
     geometric_shipyard_ftrs, 
@@ -684,28 +675,31 @@ def update_tensors_v2(
     if len(cp.ships)>0:        
         geometric_ship_ftrs[:, 0] = halite_tensor
         geometric_shipyard_ftrs[:, 0] = halite_tensor
-#         geometric_shipyard_ftrs[:, 1] = halite_tensor
     
         for i, my_ship in enumerate(cp.ships):
-            heat = distance.cdist(
-                spatial, [(my_ship.position.x, my_ship.position.y)], 
-                metric="cityblock").reshape(BOARD_SIZE, BOARD_SIZE)
-            
-            heat[my_ship.position.y, my_ship.position.x] = .75
-            
-            fleet_heat = np.minimum(fleet_heat, heat, out=fleet_heat)
-            
-            np.divide(1, heat, out=heat)
-            
-            heat_tensor = torch.as_tensor(heat, dtype=torch.float)
-            flipped = torch.flip(heat_tensor, dims=(0,))
-            torch.mul(geometric_ship_ftrs[i, 0], flipped, out=geometric_ship_ftrs[i, 0])
             shift = (BOARD_SIZE//2 - my_ship.position.x, my_ship.position.y - BOARD_SIZE//2) 
             
             geometric_ship_ftrs[i, 0] = torch.roll(
                 geometric_ship_ftrs[i, 0], 
                 shifts=(shift[0], shift[1]), 
                 dims=(1,0))
+            
+            torch.mul(geometric_ship_ftrs[i, 0], middle_heat_flipped, out=geometric_ship_ftrs[i, 0])
+            
+            heat = distance.cdist(
+                spatial, [(my_ship.position.x, my_ship.position.y)], 
+                metric="cityblock").reshape(BOARD_SIZE, BOARD_SIZE)
+             
+            heat[my_ship.position.y, my_ship.position.x] = .75
+             
+            np.minimum(fleet_heat, heat, out=fleet_heat)
+#             
+#             np.divide(1, heat, out=heat)
+#             
+#             heat_tensor = torch.as_tensor(heat, dtype=torch.float)
+#             flipped = torch.flip(heat_tensor, dims=(0,))
+            
+            
             
 #             geometric_ship_ftrs[i, 1] = flipped
                                 
@@ -895,38 +889,7 @@ class ActionSelector:
                 shipyard_count,
                 self._shipyard_rewards, 
                 self._non_terminal_shipyards)
-        
-#         with torch.no_grad():
-#             if ship_count > 0 and self._non_terminal_ships.sum() > 0:
-#                 Q_ships_next_state_cur_model = self._agent_manager.ship_cur_model(
-#                     self._geometric_ship_ftrs_v2[1, :ship_count], 
-#                     self._ts_ftrs_v2[1, :ship_count]).mul_(GAMMA)                
-#                 
-#                 Q_ships_next_state_tar_model = self._agent_manager.ship_tar_model(
-#                     self._geometric_ship_ftrs_v2[1, :ship_count], 
-#                     self._ts_ftrs_v2[1, :ship_count]).mul_(GAMMA)
-#                 
-#                 Q_ships_next = Q_ships_next_state_tar_model.gather(1, Q_ships_next_state_cur_model.max(dim=1).indices.unsqueeze(1))
-#                 
-#                 self._Q_ships_next.masked_scatter_(self._non_terminal_ships, Q_ships_next)
-#                 
-#                 
-#             if shipyard_count > 0 and self._non_terminal_shipyards.sum() > 0:
-#                 Q_shipyards_next_state_cur_model = self._agent_manager.shipyard_cur_model(
-#                     self._geometric_shipyard_ftrs_v2[1, :shipyard_count], 
-#                     self._ts_ftrs_v2[1, :shipyard_count]).mul_(GAMMA)
-#                 
-#                 Q_shipyards_next_state_tar_model = self._agent_manager.shipyard_tar_model(
-#                     self._geometric_shipyard_ftrs_v2[1, :shipyard_count], 
-#                     self._ts_ftrs_v2[1, :shipyard_count]).mul_(GAMMA)
-#                 
-#                 Q_shipyards_next = Q_shipyards_next_state_tar_model.gather(1, Q_shipyards_next_state_cur_model.max(dim=1).indices.unsqueeze(1))
-#                                 
-#                 self._Q_shipyards_next.masked_scatter_(self._non_terminal_shipyards, Q_shipyards_next)
-#         
-#         self._Q_ships_next[:ship_count].add_(self._ship_rewards[:ship_count])
-#         self._Q_shipyards_next[:shipyard_count].add_(self._shipyard_rewards[:shipyard_count])
-        
+                
         if ship_count > 0:
             self._agent_manager.store(
                 ship_count,
