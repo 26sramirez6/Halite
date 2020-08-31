@@ -995,10 +995,10 @@ class RewardEngine:
         prior_shipyards_dict = {sid: prior_board.shipyards[sid] for sid in prior_shipyards_set}
         shipyards_lost_from_collision = prior_shipyards_set.difference(current_shipyards_set)
         non_terminal_shipyards[[my_shipyard_ids[sid] for sid in shipyards_lost_from_collision]] = 0
-        
+        max_halite = float(max(prior_board.observation['halite']))
         rewards = {shipyard.id: 
-           int(shipyard.next_action==ShipyardAction.SPAWN)*500 +
-           int(shipyard.next_action==None)*-50
+           int(shipyard.next_action==ShipyardAction.SPAWN)*500/max_halite +
+           int(shipyard.next_action==None)*-50/max_halite
            for shipyard in prior_shipyards_dict.values()}
         rewards = {sid: v*(1-self.reward_step*current_board.step) for sid, v in rewards.items()}
         shipyard_rewards[:prior_shipyard_count] = torch.tensor(list(rewards.values()), dtype=torch.float)
