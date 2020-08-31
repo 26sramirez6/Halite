@@ -236,7 +236,7 @@ class AgentStateManager:
                     self._ts_shipyard_ftrs_t1[shipyard_idxs],
                     self._shipyard_rewards[shipyard_idxs],
                     self._shipyard_actions[shipyard_idxs],
-                    self._ship_non_terminals[shipyard_idxs])       
+                    self._shipyard_non_terminals[shipyard_idxs])       
     
     def train_current_models(self):
         if self.ship_model_samples > TRAIN_BATCH_SIZE:
@@ -327,6 +327,8 @@ class AgentStateManager:
                 ts_ftrs_t1).detach().mul_(GAMMA)
             
             Q_next_state_targets = Q_next_state_tar_model.gather(1, Q_next_state_cur_model.max(dim=1).indices.unsqueeze(1))
+        else:
+            Q_next_state_targets = torch.zeros(rewards.shape[0], dtype=torch.float).unsqueeze(1).detach()
             
         Q_next_state_targets.add_(rewards.unsqueeze(1))
                        
@@ -399,7 +401,7 @@ class AgentStateManager:
             self._ts_shipyard_ftrs_t1[start_shipyard:end_shipyard] = ts_ftrs_t1
             self._shipyard_actions[start_shipyard:end_shipyard] = actions
             self._shipyard_rewards[start_shipyard:end_shipyard] = rewards
-                        
+            self._shipyard_non_terminals[start_shipyard:end_shipyard] = non_terminals
 #             self._Q_shipyard[start_shipyard:end_shipyard] = pred_Q
 #             self._target_Q_shipyard[start_shipyard:end_shipyard] = target_Q
             
@@ -860,7 +862,7 @@ class ActionSelector:
                 shipyard_actions_f[shipyard_actions_f==0] = float('-inf')
                 self._best_shipyard_actions[:shipyard_count] = shipyard_actions_f.argsort(descending=True) < max_new_ships_allowed
         self._prior_ship_cargo.copy_(self._current_ship_cargo)
-        
+        print(self._best_shipyard_actions[:shipyard_count])
         new_board = step_forward(
             board, 
             self._best_ship_actions, 
