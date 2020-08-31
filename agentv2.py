@@ -20,7 +20,7 @@ from kaggle_environments.envs.halite.helpers import * #@UnusedWildImport
 from kaggle_environments import make #@UnusedImport
 from random import choice #@UnusedImport
 
-EPISODE_STEPS = 400
+EPISODE_STEPS = 50
 MAX_EPISODES_MEMORY = 500
 MAX_SHIPS = 100
 STARTING = 5000
@@ -198,8 +198,8 @@ class AgentStateManager:
         self._shipyard_losses_stored = 0
         if self.total_episodes_seen + EPISODE_STEPS > MAX_EPISODES_MEMORY:
             self.total_episodes_seen = 0
-        torch.save(self.ship_tar_model.state_dict(), "{0}/{1}_{0}.nn".format(TIMESTAMP, "ship_dqn"))
-        torch.save(self.shipyard_tar_model.state_dict(), "{0}/{1}_{0}.nn".format(TIMESTAMP, "shipyard_dqn"))
+        torch.save(self.ship_cur_model.state_dict(), "{0}/{1}_{0}.nn".format(TIMESTAMP, "ship_dqn"))
+        torch.save(self.shipyard_cur_model.state_dict(), "{0}/{1}_{0}.nn".format(TIMESTAMP, "shipyard_dqn"))
             
     def set_prior_ship_cargo(self, prior_ship_cargo):
         self.prior_ship_cargo.copy_(prior_ship_cargo)
@@ -843,7 +843,8 @@ class ActionSelector:
                 Q_ships_current = self._agent_manager.ship_cur_model(
                     self._geometric_ship_ftrs_v2[0, :ship_count], 
                     self._ts_ftrs_v2[0, :ship_count])
-                print(Q_ships_current, file=sys.__stdout__)
+                if PRINT_STATEMENTS:
+                    print(Q_ships_current, file=sys.__stdout__)
             if shipyard_count > 0:
                 Q_shipyards_current = self._agent_manager.shipyard_cur_model(
                     self._geometric_shipyard_ftrs_v2[0, :shipyard_count], 
@@ -968,8 +969,9 @@ class ActionSelector:
             board, 
             ship_count, 
             shipyard_count, 
-            current_halite)            
-        print("next action:", self._best_ship_actions[0])
+            current_halite)
+        if PRINT_STATEMENTS:   
+            print("next action:", self._best_ship_actions[0])
         set_next_actions(board, self._best_ship_actions, self._best_shipyard_actions)
         
         return self._ship_rewards[:ship_count], self._shipyard_rewards[:shipyard_count]
@@ -1116,7 +1118,7 @@ class Outputter:
         axis[0].grid()
         axis[1].grid()
         fig.savefig("{0}/rewards.png".format(TIMESTAMP))
-        fig.close()
+        plt.close(fig)
         with open("{0}/{1}_{0}g{2}.html".format(TIMESTAMP, append_p, game_id), "w") as f:
             f.write(env.render(mode="html", width=800, height=600))
 
