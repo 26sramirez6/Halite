@@ -20,18 +20,19 @@ from kaggle_environments.envs.halite.helpers import * #@UnusedWildImport
 from kaggle_environments import make #@UnusedImport
 from random import choice #@UnusedImport
 
-EPISODE_STEPS = 50
+EPISODE_STEPS = 400
 MAX_EPISODES_MEMORY = 500
 MAX_SHIPS = 100
 STARTING = 5000
 CONVERT_COST = 500
 BOARD_SIZE = 21
 PLAYERS = 4
-GAMMA = 0.6
+GAMMA = 0.9
 TRAIN_BATCH_SIZE = 48
 TARGET_MODEL_UPDATE = 100
 LEARNING_RATE = 0.01
-CHANNELS = 1
+SHIP_CHANNELS = 2
+SHIPYARD_CHANNELS = 1
 MOMENTUM  = 0.9
 WEIGHT_DECAY = 5e-4
 SHIPYARD_ACTIONS = [None, ShipyardAction.SPAWN]
@@ -87,19 +88,19 @@ class AgentStateManager:
         self._shipyard_buffer_filled = False
         
         self._geo_ship_ftrs_t0 = torch.zeros(
-            (MAX_EPISODES_MEMORY, CHANNELS, BOARD_SIZE, BOARD_SIZE),
+            (MAX_EPISODES_MEMORY, SHIP_CHANNELS, BOARD_SIZE, BOARD_SIZE),
             dtype=torch.float).to(DEVICE)
         
         self._geo_shipyard_ftrs_t0 = torch.zeros(
-            (MAX_EPISODES_MEMORY, CHANNELS, BOARD_SIZE, BOARD_SIZE),
+            (MAX_EPISODES_MEMORY, SHIPYARD_CHANNELS, BOARD_SIZE, BOARD_SIZE),
             dtype=torch.float).to(DEVICE)
         
         self._geo_ship_ftrs_t1 = torch.zeros(
-            (MAX_EPISODES_MEMORY, CHANNELS, BOARD_SIZE, BOARD_SIZE),
+            (MAX_EPISODES_MEMORY, SHIP_CHANNELS, BOARD_SIZE, BOARD_SIZE),
             dtype=torch.float).to(DEVICE)
         
         self._geo_shipyard_ftrs_t1 = torch.zeros(
-            (MAX_EPISODES_MEMORY, CHANNELS, BOARD_SIZE, BOARD_SIZE),
+            (MAX_EPISODES_MEMORY, SHIPYARD_CHANNELS, BOARD_SIZE, BOARD_SIZE),
             dtype=torch.float).to(DEVICE)
             
         self._ts_ship_ftrs_t0 = torch.zeros(
@@ -483,6 +484,7 @@ class NoisyLinear(nn.Module):
     
 class DQN(nn.Module):
     def __init__(self, 
+         channels,
          conv_layers, 
          fc_layers, 
          fc_volume, 
@@ -501,7 +503,7 @@ class DQN(nn.Module):
         self.trained_examples = 0
         height = DQN._compute_output_dim(BOARD_SIZE, kernel, stride, pad)
         for i in range(conv_layers):
-            channels_in = CHANNELS if i==0 else filters * (2**(i-1))
+            channels_in = channels if i==0 else filters * (2**(i-1))
             channels_out = filters * (2**i)
             layer = nn.Conv2d(
                 channels_in,   # number of in channels (depth of input)
@@ -673,11 +675,21 @@ def update_tensors_v2(
     halite_tensor.div_(diff) 
     halite_tensor.mul_(2)
     halite_tensor.sub_(1)
-        
+    
+    if len(cp.ships)>2:
+        pause =True
+    
     if len(cp.ships)>0:        
         geometric_ship_ftrs[:, 0] = halite_tensor
         geometric_shipyard_ftrs[:, 0] = halite_tensor
-    
+        
+        for i, my_ship in enumerate(cp.ships):
+            heat = distance.cdist(
+                spatial, [(my_ship.position.x, my_ship.position.y)], 
+                metric="cityblock").reshape(BOARD_SIZE, BOARD_SIZE)
+            heat[my_ship.position.y, my_ship.position.x] = 0.75
+            np.minimum(fleet_heat, heat, out=fleet_heat)
+        flipped_fleet_heat = torch.flip(torch.tensor(fleet_heat, dtype=torch.float), dims=(0,))
         for i, my_ship in enumerate(cp.ships):
             shift = (BOARD_SIZE//2 - my_ship.position.x, my_ship.position.y - BOARD_SIZE//2) 
             
@@ -686,15 +698,19 @@ def update_tensors_v2(
                 shifts=(shift[0], shift[1]), 
                 dims=(1,0))
             
-            torch.mul(geometric_ship_ftrs[i, 0], middle_heat_flipped, out=geometric_ship_ftrs[i, 0])
+            flipped_fleet_heat_rolled = torch.roll(
+                flipped_fleet_heat, 
+                shifts=(shift[0], shift[1]), 
+                dims=(1,0))
+            torch.div(1, flipped_fleet_heat_rolled, out=flipped_fleet_heat_rolled)
+            diff = flipped_fleet_heat_rolled.max() - flipped_fleet_heat_rolled.min()
+            flipped_fleet_heat_rolled.sub_(halite_tensor.min())
+            flipped_fleet_heat_rolled.div_(diff) 
+            flipped_fleet_heat_rolled.mul_(2)
+            flipped_fleet_heat_rolled.sub_(1)
             
-            heat = distance.cdist(
-                spatial, [(my_ship.position.x, my_ship.position.y)], 
-                metric="cityblock").reshape(BOARD_SIZE, BOARD_SIZE)
-             
-            heat[my_ship.position.y, my_ship.position.x] = .75
-             
-            np.minimum(fleet_heat, heat, out=fleet_heat)
+            torch.mul(geometric_ship_ftrs[i, 0], middle_heat_flipped, out=geometric_ship_ftrs[i, 0])
+            geometric_ship_ftrs[i, 1] = flipped_fleet_heat_rolled
 #             
 #             np.divide(1, heat, out=heat)
 #             
@@ -759,11 +775,11 @@ class ActionSelector:
         self._best_shipyard_actions = np.zeros(MAX_SHIPS, dtype=np.int32)
         
         self._geometric_ship_ftrs_v2 = torch.zeros(#@UndefinedVariable
-            (2, MAX_SHIPS, CHANNELS, BOARD_SIZE, BOARD_SIZE), 
+            (2, MAX_SHIPS, SHIP_CHANNELS, BOARD_SIZE, BOARD_SIZE), 
             dtype=torch.float).to(DEVICE)#@UndefinedVariable
         
         self._geometric_shipyard_ftrs_v2 = torch.zeros(#@UndefinedVariable
-            (2, MAX_SHIPS, CHANNELS, BOARD_SIZE, BOARD_SIZE), 
+            (2, MAX_SHIPS, SHIPYARD_CHANNELS, BOARD_SIZE, BOARD_SIZE), 
             dtype=torch.float).to(DEVICE)#@UndefinedVariable
             
         self._ts_ftrs_v2 = torch.zeros(#@UndefinedVariable
@@ -853,16 +869,21 @@ class ActionSelector:
             conversion_indices = np.where(retmax.indices==5)[0][max_new_shipyards_allowed:]
             self._Q_ships_current_adj[conversion_indices, 5] = float('-inf')
             self._best_ship_actions[:ship_count] = self._Q_ships_current_adj[:ship_count].argmax(dim=1)
+            if 5 in self._best_ship_actions:
+                pause = True 
         if shipyard_count > 0:
             retmax = Q_shipyards_current.max(dim=1)
             Q_shipyards_current_max = retmax.values
             if max_new_ships_allowed > 0:
-                shipyard_actions_f = retmax.indices.type(dtype=torch.float)
-                torch.mul(shipyard_actions_f, retmax.values, out=shipyard_actions_f)
-                shipyard_actions_f[shipyard_actions_f==0] = float('-inf')
-                self._best_shipyard_actions[:shipyard_count] = shipyard_actions_f.argsort(descending=True) < max_new_ships_allowed
+                if retmax.indices.sum() > max_new_ships_allowed:
+                    shipyard_actions_f = retmax.indices.type(dtype=torch.float)
+                    torch.mul(shipyard_actions_f, retmax.values, out=shipyard_actions_f)
+                    shipyard_actions_f[shipyard_actions_f==0] = float('-inf')
+                    self._best_shipyard_actions[:shipyard_count] = shipyard_actions_f.argsort(descending=True) < max_new_ships_allowed
+                else:
+                    self._best_shipyard_actions[:shipyard_count] = retmax.indices
         self._prior_ship_cargo.copy_(self._current_ship_cargo)
-        print(self._best_shipyard_actions[:shipyard_count])
+        
         new_board = step_forward(
             board, 
             self._best_ship_actions, 
@@ -981,7 +1002,7 @@ class RewardEngine:
             if ship.id in retained_ships else 0 
             for ship in prior_ships_dict.values()}
 #         rewards.update({sid: -500*deposit_weight for sid in ships_converted})
-#         rewards.update({sid: -750 for sid in ships_lost_from_collision})
+        rewards.update({sid: -1 for sid in ships_lost_from_collision})
 #         rewards = {sid: v*(1-self.reward_step*current_board.step) for sid, v in rewards.items()}
         ship_rewards[:prior_ship_count] = torch.tensor(list(rewards.values()), dtype=torch.float)     
 #         self._prior_ships_set = current_ships_set
@@ -999,10 +1020,10 @@ class RewardEngine:
         non_terminal_shipyards[[my_shipyard_ids[sid] for sid in shipyards_lost_from_collision]] = 0
         max_halite = float(max(prior_board.observation['halite']))
         rewards = {shipyard.id: 
-           int(shipyard.next_action==ShipyardAction.SPAWN)*500/max_halite +
+           int(shipyard.next_action==ShipyardAction.SPAWN) +
            int(shipyard.next_action==None)*-50/max_halite
            for shipyard in prior_shipyards_dict.values()}
-        rewards = {sid: v*(1-self.reward_step*current_board.step) for sid, v in rewards.items()}
+#         rewards = {sid: v*(1-self.reward_step*current_board.step) for sid, v in rewards.items()}
         shipyard_rewards[:prior_shipyard_count] = torch.tensor(list(rewards.values()), dtype=torch.float)
         
 #         self._prior_shipyards_set = current_shipyards_set
@@ -1069,19 +1090,25 @@ class Outputter:
             self._ship_losses = torch.cat((self._ship_losses, asm.ship_losses))  
             self._shipyard_losses = torch.cat((self._shipyard_losses, asm.shipyard_losses)) 
             
-        fig, axis = plt.subplots(1, 2)
+        fig, axis = plt.subplots(1, 3)
         arr = np.array(self._all_rewards)
-        ma_len = 100
-        ma = self._moving_average(arr, ma_len)
+        ma1_len = 100
+        ma2_len = 1000
+        ma1 = self._moving_average(arr, ma1_len)
+        ma2 = self._moving_average(arr, ma2_len)
         axis[0].plot(range(len(arr)), arr, label="Step Reward")
-        axis[0].plot(range(ma_len,len(ma)+ma_len), ma, label="MA")
+        axis[0].plot(range(ma1_len,len(ma1)+ma1_len), ma1, label="MA{0}".format(ma1_len))
+        axis[0].plot(range(ma2_len,len(ma2)+ma2_len), ma2, label="MA{0}".format(ma2_len))
         
         axis[1].plot(range(len(self._ship_losses)), np.array(self._ship_losses), label="Ship Model Loss", color="red")
+        axis[2].plot(range(len(self._shipyard_losses)), np.array(self._shipyard_losses), label="Shipyard Model Loss", color="green")
         
         axis[0].legend()
         axis[1].legend()
+        axis[2].legend()
         axis[0].grid()
         axis[1].grid()
+        axis[2].grid()
         fig.savefig("{0}/rewards.png".format(TIMESTAMP))
         plt.close(fig)
         with open("{0}/{1}_{0}g{2}.html".format(TIMESTAMP, append_p, game_id), "w") as f:
@@ -1104,7 +1131,8 @@ i = 1
 agents = [agent]
 
 ship_dqn_cur = DQN(
-    2,  # number of conv layers
+    SHIP_CHANNELS,  # channels in
+    3,  # number of conv layers
     1,  # number of fully connected layers at end
     64, # number of neurons in fully connected layers at end
     8,  # number of start filters for conv layers (depth)
@@ -1115,7 +1143,8 @@ ship_dqn_cur = DQN(
     6   # out nerouns
 ).to(DEVICE)  
 shipyard_dqn_cur = DQN(
-    2,  # number of conv layers
+    SHIPYARD_CHANNELS,  # channels in
+    3,  # number of conv layers
     1,  # number of fully connected layers at end
     64, # number of neurons in fully connected layers at end
     8,  # number of start filters for conv layers (depth)
@@ -1127,7 +1156,8 @@ shipyard_dqn_cur = DQN(
 ).to(DEVICE) 
  
 ship_dqn_tar = DQN(
-    2,  # number of conv layers
+    SHIP_CHANNELS, # channels in
+    3,  # number of conv layers
     1,  # number of fully connected layers at end
     64, # number of neurons in fully connected layers at end
     8,  # number of start filters for conv layers (depth)
@@ -1138,7 +1168,8 @@ ship_dqn_tar = DQN(
     6   # out nerouns
 ).to(DEVICE)  
 shipyard_dqn_tar = DQN(
-    2,  # number of conv layers
+    SHIPYARD_CHANNELS, #channels in
+    3,  # number of conv layers
     1,  # number of fully connected layers at end
     64, # number of neurons in fully connected layers at end
     8,  # number of start filters for conv layers (depth)
