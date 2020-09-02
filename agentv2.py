@@ -44,7 +44,7 @@ GAME_COUNT = 1000
 TIMESTAMP = str(datetime.datetime.now()).replace(' ', '_').replace(':', '.').replace('-',"_")
 SERIALIZE = False
 OUTPUT_LOGS = True
-PRINT_STATEMENTS = True
+PRINT_STATEMENTS = False
 TRAIN_MODELS = True
 RANDOM_SEED = -1; 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu") #@UndefinedVariable
@@ -1068,8 +1068,7 @@ class RewardEngine:
         current_player = current_board.current_player
         prior_player = prior_board.current_player
         
-        if len(ships_lost_from_collision>0):
-            pause = True
+
         my_shipyard_ids = {shipyard.id:i for i, shipyard in enumerate(prior_player.shipyards)}
         current_shipyards_set = set([shipyard.id for shipyard in current_player.shipyards])
         prior_shipyards_set = set([shipyard.id for shipyard in prior_player.shipyards])
