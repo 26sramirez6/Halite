@@ -1148,7 +1148,7 @@ class Outputter:
             self._ship_losses = torch.cat((self._ship_losses, asm.ship_losses))  
             self._shipyard_losses = torch.cat((self._shipyard_losses, asm.shipyard_losses)) 
             
-        fig, axis = plt.subplots(1, 3)
+        fig, axis = plt.subplots(1, 3, figsize=(60, 20))
         arr = np.array(self._all_rewards)
         ma1_len = 100
         ma2_len = 1000
@@ -1161,9 +1161,9 @@ class Outputter:
         axis[1].plot(range(len(self._ship_losses)), np.array(self._ship_losses), label="Ship Model Loss", color="red")
         axis[2].plot(range(len(self._shipyard_losses)), np.array(self._shipyard_losses), label="Shipyard Model Loss", color="green")
         
-        axis[0].legend()
-        axis[1].legend()
-        axis[2].legend()
+#         axis[0].legend()
+#         axis[1].legend()
+#         axis[2].legend()
         axis[0].grid()
         axis[1].grid()
         axis[2].grid()
