@@ -671,14 +671,7 @@ class FeatureCalculator:
                  range(0, len(halite), BOARD_SIZE)], 
                 dtype=torch.float) 
         
-        current_ship_cargo[0] = sum([ship.halite for ship in cp.ships])
-        
-        if current_ship_cargo[0] > 0:
-            for my_shipyard in cp.shipyards:
-                halite_tensor[ 
-                    BOARD_SIZE - my_shipyard.position.y - 1, 
-                    my_shipyard.position.x] = current_ship_cargo[0]
-                    
+        current_ship_cargo[0] = sum([ship.halite for ship in cp.ships])                    
         max_halite_cell = halite_tensor.max()
         min_halite_cell = halite_tensor.min()
         diff = max_halite_cell - min_halite_cell
@@ -688,24 +681,36 @@ class FeatureCalculator:
         halite_tensor.sub_(1)
         
         ship_count = len(cp.ships)
+        shipyard_count = len(cp.shipyards)
+        
         if ship_count>0:        
             geometric_ship_ftrs[:, 0] = halite_tensor
-            geometric_shipyard_ftrs[:, 0] = halite_tensor
             ship_positions_yx = np.array([(my_ship.position.y, my_ship.position.x) for my_ship in cp.ships])
+        
+        if shipyard_count>0 and ship_count>0:
+            if ship_count>1:
+                pause = True
+            shipyard_positions_yx = np.array([(my_shipyard.position.y, my_shipyard.position.x) for my_shipyard in cp.shipyards])
+            shift_shipyard_positions_yx = np.array([
+                (BOARD_SIZE//2 - my_shipyard.position.y, 
+                 BOARD_SIZE//2 - my_shipyard.position.x) 
+                for my_shipyard in cp.shipyards])
             
-#             heats = distance.cdist(
-#                     cls.spatial, ship_positions, 
-#                     metric="cityblock").reshape(BOARD_SIZE, BOARD_SIZE, len(cp.ships))
+            ending_ship_positions_yx = (
+                np.tile(ship_positions_yx, (shipyard_count,1)) +
+                shift_shipyard_positions_yx.repeat(ship_count,axis=0)
+            ).reshape(-1, 2)
             
-            for i, my_ship in enumerate(cp.ships):
-                heat = distance.cdist(
-                    cls.spatial, [(my_ship.position.x, my_ship.position.y)], 
-                    metric="cityblock").reshape(BOARD_SIZE, BOARD_SIZE)
-                heat[my_ship.position.y, my_ship.position.x] = 0.75
-                np.minimum(cls.fleet_heat, heat, out=cls.fleet_heat)
-                
-            flipped_fleet_heat = torch.flip(torch.tensor(cls.fleet_heat, dtype=torch.float), dims=(0,))
+            heats = distance.cdist(
+                cls.spatial, ending_ship_positions_yx, 
+                metric="cityblock").reshape(BOARD_SIZE, BOARD_SIZE, ship_count, shipyard_count)
+            heats = heats.min(2)
             
+            np.divide(1, heats + 1, out=heats)
+            flipped_heats = torch.flip(torch.as_tensor(heats, dtype=torch.float), dims=(0,)).transpose(2,0)
+            torch.mul(1 - remaining, flipped_heats, out=geometric_shipyard_ftrs[:shipyard_count, 0])
+        
+        if ship_count>0:
             for i, my_ship in enumerate(cp.ships):
                 shift = (BOARD_SIZE//2 - my_ship.position.x, my_ship.position.y - BOARD_SIZE//2) 
                 
@@ -713,7 +718,13 @@ class FeatureCalculator:
                     i, 0, 
                     BOARD_SIZE - 1 - ship_positions_yx[cls.selector[i, :ship_count], 0], 
                     ship_positions_yx[cls.selector[i, :ship_count], 1]] = -2
-                    
+                
+                if shipyard_count>0:
+                    geometric_ship_ftrs[
+                        i, 0,
+                        BOARD_SIZE - 1 - shipyard_positions_yx[:, 0],
+                        shipyard_positions_yx[:, 1]] = ((my_ship.halite / diff) * 2 - 1)**(2-remaining)
+                
                 geometric_ship_ftrs[i, 0] = torch.roll(
                     geometric_ship_ftrs[i, 0], 
                     shifts=(shift[0], shift[1]), 
@@ -755,30 +766,35 @@ class FeatureCalculator:
     #             geometric_ship_ftrs[[j for j in range(len(cp.ships)) if j!= i], 0, 
     #                 BOARD_SIZE - my_ship.position.y - 1, my_ship.position.x] = -500
                     
-        if len(cp.shipyards)>0:
-            np.divide(1, cls.fleet_heat, out=cls.fleet_heat)
-            for i, my_shipyard in enumerate(cp.shipyards):
-                heat = distance.cdist(
-                    cls.spatial, [(my_shipyard.position.x, my_shipyard.position.y)], 
-                    metric="cityblock").reshape(BOARD_SIZE, BOARD_SIZE)
-                            
-                heat[my_shipyard.position.y, my_shipyard.position.x] = 0.75
-                
-                np.minimum(heat, cls.fleet_heat, out=heat)
-                
-                np.divide(1, heat, out=heat)
-                
-                flipped = torch.flip(torch.as_tensor(heat, dtype=torch.float), dims=(0,))
-                
-                torch.mul(remaining, flipped, out=flipped)
-                torch.mul(halite_tensor, flipped, out=geometric_shipyard_ftrs[i, 0])
-                
-                shift = (BOARD_SIZE//2 - my_shipyard.position.x, my_shipyard.position.y - BOARD_SIZE//2) 
-                
-                geometric_shipyard_ftrs[i, 0] = torch.roll(
-                    geometric_shipyard_ftrs[i, 0], 
-                    shifts=(shift[0], shift[1]), 
-                    dims=(1,0))
+#         if len(cp.shipyards)>0:
+#             for i, my_shipyard in enumerate(cp.shipyards):
+#                 
+#                 heat = distance.cdist(
+#                     cls.spatial, [(my_shipyard.position.x, my_shipyard.position.y)], 
+#                     metric="cityblock").reshape(BOARD_SIZE, BOARD_SIZE)
+#                             
+#                 heat[my_shipyard.position.y, my_shipyard.position.x] = 0.75
+#                 
+#                 np.minimum(heat, cls.fleet_heat, out=heat)
+#                 
+#                 np.divide(1, heat, out=heat)
+#                 
+#                 flipped = torch.flip(torch.as_tensor(heat, dtype=torch.float), dims=(0,))
+#                 
+#                 torch.mul(remaining, flipped, out=flipped)
+#                 torch.mul(halite_tensor, flipped, out=geometric_shipyard_ftrs[i, 0])
+#                 
+#                 shift = (BOARD_SIZE//2 - my_shipyard.position.x, my_shipyard.position.y - BOARD_SIZE//2) 
+#                 
+#                 geometric_shipyard_ftrs[i, 0] = torch.roll(
+#                     geometric_shipyard_ftrs[i, 0], 
+#                     shifts=(shift[0], shift[1]), 
+#                     dims=(1,0))
+#                 
+#                 shifted_ship_positions_yx = (
+#                     np.tile(ship_positions_yx, (shipyard_count,1)) +
+#                     shifted_shipyard_positions_yx.repeat(ship_count,axis=0)
+#                 ).reshape(shipyard_count, ship_count, 2)
                 
                 
         ts_ftrs[:, 1] = cp.halite
@@ -926,17 +942,20 @@ class ActionSelector:
             self._prior_ship_cargo)
         
         if ship_count > 0:
-            self._reward_engine.compute_ship_rewards(
+            ships_lost_from_collision = self._reward_engine.compute_ship_rewards(
                 new_board, 
                 board, 
                 ship_count,
                 self._ship_rewards, 
                 self._non_terminal_ships)
-
+        else:
+            ships_lost_from_collision = set()
+            
         if shipyard_count > 0:
             self._reward_engine.compute_shipyard_rewards(
                 new_board, 
                 board, 
+                ships_lost_from_collision,
                 shipyard_count,
                 self._shipyard_rewards, 
                 self._non_terminal_shipyards)
@@ -1011,7 +1030,7 @@ class RewardEngine:
         prior_player = prior_board.current_player        
         
         my_ship_ids = {ship.id:i for i, ship in enumerate(prior_player.ships)}
-        
+        my_ship_ids_rev = {k:v for k,v in my_ship_ids.items()}
         current_ships_set = set([ship.id for ship in current_player.ships])
         prior_ships_set = set([ship.id for ship in prior_player.ships])
         prior_ships_dict = {sid: prior_board.ships[sid] for sid in prior_ships_set}
@@ -1024,38 +1043,49 @@ class RewardEngine:
         non_terminal_ships[[my_ship_ids[sid] for sid in ships_converted.union(ships_lost_from_collision)]] = 0
         max_halite = float(max(prior_board.observation['halite']))
         rewards = {ship.id: 
-            max(0, current_halite_cargo[ship.id] - ship.halite)/max_halite#+ # diff halite cargo
-#             max(0, ship.halite - current_halite_cargo[ship.id])*deposit_weight + # diff halite deposited
+            max(0, current_halite_cargo[ship.id] - ship.halite)/max_halite + # diff halite cargo
+            max(0, ship.halite - current_halite_cargo[ship.id])/max_halite # diff halite deposited
 #             int(ship.halite==current_halite_cargo[ship.id] and ship.next_action==None)*-5 # inactivity
             if ship.id in retained_ships else 0 
             for ship in prior_ships_dict.values()}
 #         rewards.update({sid: -500*deposit_weight for sid in ships_converted})
         rewards.update({sid: -1 for sid in ships_lost_from_collision})
+        rewards = {my_ship_ids_rev[sid]:r for sid, r in rewards.items()}
 #         rewards = {sid: v*(1-self.reward_step*current_board.step) for sid, v in rewards.items()}
+        
         ship_rewards[:prior_ship_count] = torch.tensor(list(rewards.values()), dtype=torch.float)     
 #         self._prior_ships_set = current_ships_set
 #         self._prior_ships_dict = {sid: current_board.ships[sid] for sid in current_ships_set}
+        return ships_lost_from_collision
     
-    def compute_shipyard_rewards(self, current_board, prior_board, prior_shipyard_count, shipyard_rewards, non_terminal_shipyards):
+    def compute_shipyard_rewards(self, 
+             current_board, 
+             prior_board, 
+             ships_lost_from_collision,
+             prior_shipyard_count, 
+             shipyard_rewards, 
+             non_terminal_shipyards):
         current_player = current_board.current_player
         prior_player = prior_board.current_player
         
+        if len(ships_lost_from_collision>0):
+            pause = True
         my_shipyard_ids = {shipyard.id:i for i, shipyard in enumerate(prior_player.shipyards)}
         current_shipyards_set = set([shipyard.id for shipyard in current_player.shipyards])
         prior_shipyards_set = set([shipyard.id for shipyard in prior_player.shipyards])
         prior_shipyards_dict = {sid: prior_board.shipyards[sid] for sid in prior_shipyards_set}
         shipyards_lost_from_collision = prior_shipyards_set.difference(current_shipyards_set)
         non_terminal_shipyards[[my_shipyard_ids[sid] for sid in shipyards_lost_from_collision]] = 0
-        max_halite = float(max(prior_board.observation['halite']))
-        rewards = {shipyard.id: 
-           int(shipyard.next_action==ShipyardAction.SPAWN) +
-           int(shipyard.next_action==None)*-50/max_halite
-           for shipyard in prior_shipyards_dict.values()}
-#         rewards = {sid: v*(1-self.reward_step*current_board.step) for sid, v in rewards.items()}
-        shipyard_rewards[:prior_shipyard_count] = torch.tensor(list(rewards.values()), dtype=torch.float)
+        ship_collision_positions = set([prior_board.ships[sid].position for sid in ships_lost_from_collision])
         
-#         self._prior_shipyards_set = current_shipyards_set
-#         self._prior_shipyards_dict = {sid: current_board.shipyards[sid] for sid in current_shipyards_set}
+        max_halite = float(max(prior_board.observation['halite']))
+                
+        rewards = {shipyard.id: 
+           (current_player.halite - prior_player.halite)/max_halite +
+           int(shipyard.position in ship_collision_positions)*-250./max_halite
+           for shipyard in prior_shipyards_dict.values()}
+        
+        shipyard_rewards[:prior_shipyard_count] = torch.tensor(list(rewards.values()), dtype=torch.float)
     
     def reset_state(self):
         self._prior_ships_dict = {}
