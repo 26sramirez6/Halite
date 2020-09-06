@@ -22,16 +22,16 @@ from kaggle_environments import make #@UnusedImport
 from random import choice #@UnusedImport
 
 EPISODE_STEPS = 400
-MAX_EPISODES_MEMORY = 500
+MAX_EPISODES_MEMORY = 400*30
 MAX_SHIPS = 100
 STARTING = 5000
 CONVERT_COST = 500
 BOARD_SIZE = 21
 PLAYERS = 4
-GAMMA = 0.9
+GAMMA = 0.8
 TRAIN_BATCH_SIZE = 48
-TARGET_MODEL_UPDATE = 100
-LEARNING_RATE = 0.01
+TARGET_MODEL_UPDATE = 1000
+LEARNING_RATE = 0.05
 SHIP_CHANNELS = 1
 SHIPYARD_CHANNELS = 1
 MOMENTUM  = 0.9
@@ -42,7 +42,6 @@ SHIP_MOVE_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,Shi
 TS_FTR_COUNT = 1 + PLAYERS*2 
 GAME_COUNT = 1000
 TIMESTAMP = str(datetime.datetime.now()).replace(' ', '_').replace(':', '.').replace('-',"_")
-SERIALIZE = False
 OUTPUT_LOGS = True
 PRINT_STATEMENTS = False
 TRAIN_MODELS = True
@@ -308,7 +307,7 @@ class AgentStateManager:
         
         current_model.train()
         optimizer.zero_grad()
-        Q_current = current_model(geo_ftrs_t0, ts_ftrs_t0).gather(1, actions.unsqueeze(1))
+        Q_current = current_model(geo_ftrs_t0.detach(), ts_ftrs_t0.detach()).gather(1, actions.unsqueeze(1))
         
         if non_terminals.sum() > 0:
             Q_next_state_cur_model = current_model(
@@ -366,7 +365,7 @@ class AgentStateManager:
             
             start_ship = self.ship_model_samples
             end_ship = self.ship_model_samples + count
-            
+             
             self._geo_ship_ftrs_t0[start_ship:end_ship] = geo_ftrs_t0
             self._geo_ship_ftrs_t1[start_ship:end_ship] = geo_ftrs_t1
             self._ts_ship_ftrs_t0[start_ship:end_ship] = ts_ftrs_t0
@@ -385,8 +384,6 @@ class AgentStateManager:
                 
             start_shipyard = self.shipyard_model_samples
             end_shipyard = self.shipyard_model_samples + count
-            
-            self.shipyard_model_samples += count
             
             self._geo_shipyard_ftrs_t0[start_shipyard:end_shipyard] = geo_ftrs_t0
             self._geo_shipyard_ftrs_t1[start_shipyard:end_shipyard] = geo_ftrs_t1
@@ -409,7 +406,7 @@ def timer(func):
     return wrapper_timer
 
 class NoisyLinear(nn.Module):
-    def __init__(self, in_features, out_features, std_init=0.1):
+    def __init__(self, in_features, out_features, std_init=1):
         super(NoisyLinear, self).__init__()
         
         self.in_features  = in_features
@@ -688,16 +685,16 @@ class FeatureCalculator:
             for i, my_ship in enumerate(cp.ships):
                 shift = (BOARD_SIZE//2 - my_ship.position.x, my_ship.position.y - BOARD_SIZE//2) 
                 
-                geometric_ship_ftrs[
-                    i, 0, 
-                    BOARD_SIZE - 1 - ship_positions_yx[cls.selector[i, :ship_count], 0], 
-                    ship_positions_yx[cls.selector[i, :ship_count], 1]] = -2
-                
                 if shipyard_count>0:
                     geometric_ship_ftrs[
                         i, 0,
                         BOARD_SIZE - 1 - shipyard_positions_yx[:, 0],
                         shipyard_positions_yx[:, 1]] = ((my_ship.halite / diff.item()) * 2 - 1)*(2-remaining)
+                        
+                geometric_ship_ftrs[
+                    i, 0, 
+                    BOARD_SIZE - 1 - ship_positions_yx[cls.selector[i, :ship_count], 0], 
+                    ship_positions_yx[cls.selector[i, :ship_count], 1]] = -2
                 
                 geometric_ship_ftrs[i, 0] = torch.roll(
                     geometric_ship_ftrs[i, 0], 
@@ -805,47 +802,50 @@ class ActionSelector:
             self._prior_ship_cargo)
         max_new_shipyards_allowed = int(current_halite * SHIPYARD_HALITE_ALLOCATION) // board.configuration.convert_cost
         max_new_ships_allowed = int(current_halite * SHIP_HALITE_ALLOCATION) // board.configuration.spawn_cost
-        
-        with torch.no_grad():
+        if board.step==0:
+            self._best_ship_actions[0] = 5
+            converted_count = 1
+        else:
+            with torch.no_grad():
+                if ship_count > 0:
+                    Q_ships_current = self._agent_manager.ship_cur_model(
+                        self._geometric_ship_ftrs_v2[0, :ship_count], 
+                        self._ts_ftrs_v2[0, :ship_count])
+                    if PRINT_STATEMENTS:
+                        print(Q_ships_current, file=sys.__stdout__)
+                if shipyard_count > 0:
+                    Q_shipyards_current = self._agent_manager.shipyard_cur_model(
+                        self._geometric_shipyard_ftrs_v2[0, :shipyard_count], 
+                        self._ts_ftrs_v2[0, :shipyard_count])
+                    if PRINT_STATEMENTS:
+                        print(Q_shipyards_current, file=sys.__stdout__)
+            converted_count = 0
             if ship_count > 0:
-                Q_ships_current = self._agent_manager.ship_cur_model(
-                    self._geometric_ship_ftrs_v2[0, :ship_count], 
-                    self._ts_ftrs_v2[0, :ship_count])
-                if PRINT_STATEMENTS:
-                    print(Q_ships_current, file=sys.__stdout__)
+                self._Q_ships_current_adj[:ship_count] = Q_ships_current
+                retmax = Q_ships_current.max(dim=1)
+                conversion_indices = np.where(retmax.indices==5)[0][max_new_shipyards_allowed:]
+                self._Q_ships_current_adj[conversion_indices, 5] = float('-inf')
+                self._best_ship_actions[:ship_count] = self._Q_ships_current_adj[:ship_count].argmax(dim=1)
+                converted_count += (self._best_ship_actions[:ship_count]==5).sum()
+                
             if shipyard_count > 0:
-                Q_shipyards_current = self._agent_manager.shipyard_cur_model(
-                    self._geometric_shipyard_ftrs_v2[0, :shipyard_count], 
-                    self._ts_ftrs_v2[0, :shipyard_count])
-                if PRINT_STATEMENTS:
-                    print(Q_shipyards_current, file=sys.__stdout__)
-        converted_count = 0
-        if ship_count > 0:
-            self._Q_ships_current_adj[:ship_count] = Q_ships_current
-            retmax = Q_ships_current.max(dim=1)
-            conversion_indices = np.where(retmax.indices==5)[0][max_new_shipyards_allowed:]
-            self._Q_ships_current_adj[conversion_indices, 5] = float('-inf')
-            self._best_ship_actions[:ship_count] = self._Q_ships_current_adj[:ship_count].argmax(dim=1)
-            converted_count += (self._best_ship_actions[:ship_count]==5).sum()
-            
-        if shipyard_count > 0:
-            retmax = Q_shipyards_current.max(dim=1)
-            if max_new_ships_allowed > 0:
-                if retmax.indices.sum() > max_new_ships_allowed:
-                    shipyard_actions_f = retmax.indices.type(dtype=torch.float)
-                    torch.mul(shipyard_actions_f, retmax.values, out=shipyard_actions_f)
-                    shipyard_actions_f[shipyard_actions_f==0] = float('-inf')
-                    self._best_shipyard_actions[:shipyard_count] = shipyard_actions_f.argsort(descending=True) < max_new_ships_allowed
-                else:
-                    self._best_shipyard_actions[:shipyard_count] = retmax.indices
-                if self._best_shipyard_actions[:shipyard_count].sum() > 0 and ship_count>0:
-                    cp = board.current_player
-                    force_remove_spawn = [
-                        i for i, shipyard in enumerate(cp.shipyards) 
-                            if (self._best_shipyard_actions[i] and 
-                                shipyard.cell.ship is not None)
-                            ]
-                    self._best_shipyard_actions[force_remove_spawn] = 0    
+                retmax = Q_shipyards_current.max(dim=1)
+                if max_new_ships_allowed > 0:
+                    if retmax.indices.sum() > max_new_ships_allowed:
+                        shipyard_actions_f = retmax.indices.type(dtype=torch.float)
+                        torch.mul(shipyard_actions_f, retmax.values, out=shipyard_actions_f)
+                        shipyard_actions_f[shipyard_actions_f==0] = float('-inf')
+                        self._best_shipyard_actions[:shipyard_count] = shipyard_actions_f.argsort(descending=True) < max_new_ships_allowed
+                    else:
+                        self._best_shipyard_actions[:shipyard_count] = retmax.indices
+                    if self._best_shipyard_actions[:shipyard_count].sum() > 0 and ship_count>0:
+                        cp = board.current_player
+                        force_remove_spawn = [
+                            i for i, shipyard in enumerate(cp.shipyards) 
+                                if (self._best_shipyard_actions[i] and 
+                                    shipyard.cell.ship is not None)
+                                ]
+                        self._best_shipyard_actions[force_remove_spawn] = 0    
                 
                     
         self._prior_ship_cargo.copy_(self._current_ship_cargo)
@@ -926,8 +926,7 @@ class ActionSelector:
             ship_count, 
             shipyard_count, 
             current_halite)
-        if PRINT_STATEMENTS:   
-            print("next action:", self._best_ship_actions[0])
+        
         set_next_actions(board, self._best_ship_actions, self._best_shipyard_actions)
         
         return self._ship_rewards[:ship_count], self._shipyard_rewards[:shipyard_count]
@@ -953,7 +952,7 @@ class RewardEngine:
         prior_player = prior_board.current_player        
         
         my_ship_ids = {ship.id:i for i, ship in enumerate(prior_player.ships)}
-        my_ship_ids_rev = {k:v for k,v in my_ship_ids.items()}
+#         my_ship_ids_rev = {k:v for k,v in my_ship_ids.items()}
         current_ships_set = set([ship.id for ship in current_player.ships])
         prior_ships_set = set([ship.id for ship in prior_player.ships])
         prior_ships_dict = {sid: prior_board.ships[sid] for sid in prior_ships_set}
@@ -973,7 +972,7 @@ class RewardEngine:
             for ship in prior_ships_dict.values()}
 #         rewards.update({sid: -500*deposit_weight for sid in ships_converted})
         rewards.update({sid: -.25 for sid in ships_lost_from_collision})
-        rewards = {my_ship_ids_rev[sid]:r for sid, r in rewards.items()}
+        rewards = {my_ship_ids[sid]:r for sid, r in rewards.items()}
 #         rewards = {sid: v*(1-self.reward_step*current_board.step) for sid, v in rewards.items()}
         
         ship_rewards[:prior_ship_count] = torch.tensor(list(rewards.values()), dtype=torch.float)     
@@ -991,7 +990,6 @@ class RewardEngine:
         current_player = current_board.current_player
         prior_player = prior_board.current_player
         
-
         my_shipyard_ids = {shipyard.id:i for i, shipyard in enumerate(prior_player.shipyards)}
         current_shipyards_set = set([shipyard.id for shipyard in current_player.shipyards])
         prior_shipyards_set = set([shipyard.id for shipyard in prior_player.shipyards])
@@ -1004,12 +1002,11 @@ class RewardEngine:
             sum([ship.halite for ship in current_player.ships]) -
             sum([ship.halite for ship in prior_player.ships]))
         
-        max_halite = float(max(prior_board.observation['halite']))
-                
+        max_halite = float(max(prior_board.observation['halite']))      
         rewards = {shipyard.id:
            np.clip(halite_cargo_diff/max_halite, 0, 1.5) + 
-           np.clip((current_player.halite - prior_player.halite)/max_halite, -.1, 1.5)  +
-           max((shipyard.next_action==None)*prior_player.halite*SHIPYARD_HALITE_ALLOCATION/-1000., -.1) +
+           np.clip((current_player.halite - prior_player.halite)/max_halite, 0, 1.5)  +
+#            max(int(shipyard.next_action==None)*prior_player.halite*SHIPYARD_HALITE_ALLOCATION/-1000., -.25) +
            max(int(shipyard.next_action==ShipyardAction.SPAWN)*int(shipyard.position in ship_collision_positions)*-1, -.25)
            for shipyard in prior_shipyards_dict.values()}
         
@@ -1121,8 +1118,8 @@ ship_dqn_cur = DQN(
     3,  # number of conv layers
     1,  # number of fully connected layers at end
     64, # number of neurons in fully connected layers at end
-    8,  # number of start filters for conv layers (depth)
-    3,  # size of kernel
+    1,  # number of start filters for conv layers (depth)
+    5,  # size of kernel
     1,  # stride of the kernel
     0,  # padding
     1,  # number of extra time series features
@@ -1133,8 +1130,8 @@ shipyard_dqn_cur = DQN(
     3,  # number of conv layers
     1,  # number of fully connected layers at end
     64, # number of neurons in fully connected layers at end
-    8,  # number of start filters for conv layers (depth)
-    3,  # size of kernel
+    1,  # number of start filters for conv layers (depth)
+    5,  # size of kernel
     1,  # stride of the kernel
     0,  # padding
     1,  # number of extra time series features
@@ -1146,8 +1143,8 @@ ship_dqn_tar = DQN(
     3,  # number of conv layers
     1,  # number of fully connected layers at end
     64, # number of neurons in fully connected layers at end
-    8,  # number of start filters for conv layers (depth)
-    3,  # size of kernel
+    1,  # number of start filters for conv layers (depth)
+    5,  # size of kernel
     1,  # stride of the kernel
     0,  # padding
     1,  # number of extra time series features
@@ -1158,8 +1155,8 @@ shipyard_dqn_tar = DQN(
     3,  # number of conv layers
     1,  # number of fully connected layers at end
     64, # number of neurons in fully connected layers at end
-    8,  # number of start filters for conv layers (depth)
-    3,  # size of kernel
+    1,  # number of start filters for conv layers (depth)
+    5,  # size of kernel
     1,  # stride of the kernel
     0,  # padding
     1,  # number of extra time series features
