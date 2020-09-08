@@ -22,7 +22,7 @@ from kaggle_environments import make #@UnusedImport
 from random import choice #@UnusedImport
 
 EPISODE_STEPS = 400
-MAX_EPISODES_MEMORY = 5000
+MAX_EPISODES_MEMORY = 50000
 MAX_SHIPS = 100
 STARTING = 5000
 CONVERT_COST = 500
@@ -31,7 +31,7 @@ PLAYERS = 4
 GAMMA = 0.9
 TRAIN_BATCH_SIZE = 48
 TARGET_MODEL_UPDATE = 1000
-LEARNING_RATE = 0.05
+LEARNING_RATE = 0.01
 SHIP_CHANNELS = 1
 SHIPYARD_CHANNELS = 1
 MOMENTUM  = 0.9
@@ -80,20 +80,25 @@ class AgentStateManager:
         self.game_id = 0
         self.prior_board = None
         self.prior_ships_converted = 0
-        self._alpha = 0.2
+        self._alpha = 0.6
+        self._beta = 0.4
         self.ship_cur_model = ship_cur_model
         self.shipyard_cur_model = shipyard_cur_model
         self.ship_tar_model = ship_tar_model
         self.shipyard_tar_model = shipyard_tar_model
         self.ship_model_criterion = ship_model_criterion
+        self.ship_model_criterion.reduction = 'none'
         self.shipyard_model_criterion = shipyard_model_criterion 
+        self.shipyard_model_criterion.reduction = 'none'
         self.ship_model_optimizer = ship_model_optimizer
         self.shipyard_model_optimizer = shipyard_model_optimizer
         self.last_ship_update = 0
         self.last_shipyard_update = 0
-        self.ship_model_samples = 0
+        self._current_ship_sample_pos = 0
         self._ship_losses_stored = 0
-        self.shipyard_model_samples = 0
+        self._total_ship_samples = 0
+        self._total_shipyard_samples = 0
+        self._current_shipyard_sample_pos = 0
         self._shipyard_losses_stored = 0
         self.total_episodes_seen = 0
         self.in_game_episodes_seen = 0
@@ -161,16 +166,17 @@ class AgentStateManager:
         self._shipyard_non_terminals = torch.ones(
             MAX_EPISODES_MEMORY,
             dtype=torch.float).to(DEVICE)
-#         
-#         self._tdiffs_ship = torch.zeros(
-#             MAX_EPISODES_MEMORY,
-#             dtype=torch.float64).to(DEVICE)
-#         self._tdiffs_ship.fill_(1e-6)
-#         
-#         self._tdiffs_shipyard = torch.zeros(
-#             MAX_EPISODES_MEMORY,
-#             dtype=torch.float64).to(DEVICE)
-#         self._tdiffs_shipyard.fill_(1e-6)
+         
+        self._ship_prios = torch.zeros(
+            MAX_EPISODES_MEMORY,
+            dtype=torch.float64).to(DEVICE)
+        
+         
+        self._shipyard_prios = torch.zeros(
+            MAX_EPISODES_MEMORY,
+            dtype=torch.float64).to(DEVICE)
+        
+        
         self.current_ship_cargo = torch.zeros(
             PLAYERS, 
             dtype=torch.float).to(DEVICE) #@UndefinedVariable
@@ -217,10 +223,17 @@ class AgentStateManager:
     
     def priority_sample(self, batch_size, is_ship_model):
         if is_ship_model:
-            ship_end = MAX_EPISODES_MEMORY if self._ship_buffer_filled else self.ship_model_samples
+            ship_end = MAX_EPISODES_MEMORY if self._ship_buffer_filled else self._current_ship_sample_pos
+            probs = self._ship_prios[:ship_end] ** self._alpha
+            probs.div_(probs.sum())
+            
             ship_idxs = np.random.choice(
                 list(range(ship_end)), 
-                size=batch_size)
+                size=batch_size,
+                p=probs)
+            
+            weights = (ship_end * probs[ship_idxs])**(-min(1.0, self._beta + self._total_ship_samples * (1.0 - self._beta) / 50000))
+            weights.div_(weights.max())
             
             return (self._geo_ship_ftrs_t0[ship_idxs], 
                     self._ts_ship_ftrs_t0[ship_idxs],
@@ -229,12 +242,22 @@ class AgentStateManager:
                     self._ship_rewards[ship_idxs],
                     self._ship_actions[ship_idxs],
                     self._ship_non_terminals[ship_idxs],
-                    self._geo_ftrs_ship_converted_t1[ship_idxs])
+                    self._geo_ftrs_ship_converted_t1[ship_idxs],
+                    ship_idxs,
+                    weights)
         else:
-            shipyard_end = MAX_EPISODES_MEMORY if self._shipyard_buffer_filled else self.shipyard_model_samples
+            shipyard_end = MAX_EPISODES_MEMORY if self._shipyard_buffer_filled else self._current_shipyard_sample_pos
+            probs = self._shipyard_prios[:shipyard_end] ** self._alpha
+            probs.div_(probs.sum())
+            
             shipyard_idxs = np.random.choice(
                 list(range(shipyard_end)), 
-                size=batch_size) 
+                size=batch_size,
+                p=probs)
+            
+            weights = (shipyard_end * probs[shipyard_idxs])**(-min(1.0, self._beta + self._total_shipyard_samples * (1.0 - self._beta) / 50000))
+            weights.div_(weights.max())
+            
             return (self._geo_shipyard_ftrs_t0[shipyard_idxs], 
                     self._ts_shipyard_ftrs_t0[shipyard_idxs],
                     self._geo_shipyard_ftrs_t1[shipyard_idxs], 
@@ -242,10 +265,12 @@ class AgentStateManager:
                     self._shipyard_rewards[shipyard_idxs],
                     self._shipyard_actions[shipyard_idxs],
                     self._shipyard_non_terminals[shipyard_idxs],
-                    self._geo_ftrs_ship_spawned_t1[shipyard_idxs])       
+                    self._geo_ftrs_ship_spawned_t1[shipyard_idxs],
+                    shipyard_idxs,
+                    weights)       
     
     def train_current_models(self, ship_count, shipyard_count):
-        if self.ship_model_samples > TRAIN_BATCH_SIZE:
+        if self._current_ship_sample_pos > TRAIN_BATCH_SIZE:
             geo_ship_ftrs_t0, \
             ts_ftrs_ship_t0, \
             geo_ship_ftrs_t1, \
@@ -253,13 +278,17 @@ class AgentStateManager:
             ship_rewards, \
             ship_actions, \
             non_terminals, \
-            geo_ship_converted_ftrs_t1 = self.priority_sample(TRAIN_BATCH_SIZE, True)
+            geo_ship_converted_ftrs_t1, \
+            indices, \
+            weights = self.priority_sample(TRAIN_BATCH_SIZE, True)
                         
             mini_batch_loss = self._train_model(
                 self.ship_cur_model, 
                 self.ship_tar_model,
                 self.ship_model_criterion, 
                 self.ship_model_optimizer, 
+                indices,
+                weights,
                 geo_ship_ftrs_t0,
                 ts_ftrs_ship_t0,
                 geo_ship_ftrs_t1,
@@ -273,7 +302,7 @@ class AgentStateManager:
             
             self.save_loss(mini_batch_loss, True)
             
-        if self.shipyard_model_samples > TRAIN_BATCH_SIZE:
+        if self._current_shipyard_sample_pos > TRAIN_BATCH_SIZE:
             geo_shipyard_ftrs_t0, \
             ts_ftrs_shipyard_t0, \
             geo_shipyard_ftrs_t1, \
@@ -281,13 +310,17 @@ class AgentStateManager:
             shipyard_rewards, \
             shipyard_actions, \
             non_terminals, \
-            geo_ship_spawn_ftrs_t1 = self.priority_sample(TRAIN_BATCH_SIZE, False)
+            geo_ship_spawn_ftrs_t1, \
+            indices, \
+            weights = self.priority_sample(TRAIN_BATCH_SIZE, False)
         
             mini_batch_loss = self._train_model(
                 self.shipyard_cur_model, 
                 self.shipyard_tar_model,
                 self.shipyard_model_criterion, 
                 self.shipyard_model_optimizer, 
+                indices,
+                weights,
                 geo_shipyard_ftrs_t0,
                 ts_ftrs_shipyard_t0,
                 geo_shipyard_ftrs_t1,
@@ -301,13 +334,13 @@ class AgentStateManager:
             
             self.save_loss(mini_batch_loss, False)
         
-        if self.ship_model_samples > 0 and self.last_ship_update > TARGET_MODEL_UPDATE:
+        if self._current_ship_sample_pos > 0 and self.last_ship_update > TARGET_MODEL_UPDATE:
             self.update_target_model(self.ship_cur_model, self.ship_tar_model, True)
             self.last_ship_update = 0
         else:
             self.last_ship_update += ship_count            
         
-        if self.shipyard_model_samples > 0 and self.last_shipyard_update > TARGET_MODEL_UPDATE:
+        if self._current_shipyard_sample_pos > 0 and self.last_shipyard_update > TARGET_MODEL_UPDATE:
             self.update_target_model(self.shipyard_cur_model, self.shipyard_tar_model, False)
             self.last_shipyard_update = 0
         else:
@@ -327,6 +360,8 @@ class AgentStateManager:
         target_model,
         criterion, 
         optimizer, 
+        indices,
+        weights,
         geo_ftrs_t0,
         ts_ftrs_t0,
         geo_ftrs_t1,
@@ -375,10 +410,20 @@ class AgentStateManager:
         Q_next_state_targets.add_(rewards.unsqueeze(1))
         
         optimizer.zero_grad()               
-        loss = criterion(Q_current, Q_next_state_targets.detach())
+        loss = criterion(Q_current, Q_next_state_targets.detach()).type(torch.float64) * weights.unsqueeze(1)
+        prios = loss + 1e-5
+        loss = loss.mean()
         loss.backward()
         optimizer.step()
+        self.update_prios(indices, prios.detach(), is_ship_model) 
         return loss.item()
+    
+    def update_prios(self, indices, prios, is_ship_model):
+        if is_ship_model:
+            self._ship_prios[indices] = prios.squeeze(1)
+        else:
+            self._shipyard_prios[indices] = prios.squeeze(1)
+        return 
     
     def save_loss(self, loss, is_ship_model):
         if is_ship_model:
@@ -405,12 +450,12 @@ class AgentStateManager:
         spawn_indices=None) :   
              
         if is_ship_model:        
-            if self.ship_model_samples + count > MAX_EPISODES_MEMORY:
+            if self._current_ship_sample_pos + count > MAX_EPISODES_MEMORY:
                 self._ship_buffer_filled = True
-                self.ship_model_samples = 0
+                self._current_ship_sample_pos = 0
             
-            start_ship = self.ship_model_samples
-            end_ship = self.ship_model_samples + count
+            start_ship = self._current_ship_sample_pos
+            end_ship = self._current_ship_sample_pos + count
              
             self._geo_ship_ftrs_t0[start_ship:end_ship] = geo_ftrs_t0
             self._geo_ship_ftrs_t1[start_ship:end_ship] = geo_ftrs_t1
@@ -421,15 +466,16 @@ class AgentStateManager:
             self._ship_non_terminals[start_ship:end_ship] = non_terminals
             if conversion_indices.sum() > 0:
                 self._geo_ftrs_ship_converted_t1[start_ship:end_ship][conversion_indices.tolist()] = geo_ftrs_ship_conversions_t1
-            
-            self.ship_model_samples += count
+            self._ship_prios[start_ship:end_ship] = 1 if self._current_ship_sample_pos==0 and not self._ship_buffer_filled else self._ship_prios.max()
+            self._current_ship_sample_pos += count
+            self._total_ship_samples += count
         else:
-            if self.shipyard_model_samples + count > MAX_EPISODES_MEMORY:
+            if self._current_shipyard_sample_pos + count > MAX_EPISODES_MEMORY:
                 self._shipyard_buffer_filled = True
-                self.shipyard_model_samples = 0
+                self._current_shipyard_sample_pos = 0
                 
-            start_shipyard = self.shipyard_model_samples
-            end_shipyard = self.shipyard_model_samples + count
+            start_shipyard = self._current_shipyard_sample_pos
+            end_shipyard = self._current_shipyard_sample_pos + count
             
             self._geo_shipyard_ftrs_t0[start_shipyard:end_shipyard] = geo_ftrs_t0
             self._geo_shipyard_ftrs_t1[start_shipyard:end_shipyard] = geo_ftrs_t1
@@ -440,9 +486,10 @@ class AgentStateManager:
             self._shipyard_non_terminals[start_shipyard:end_shipyard] = non_terminals
             if spawn_indices.sum() > 0:
                 self._geo_ftrs_ship_spawned_t1[start_shipyard:end_shipyard][spawn_indices.tolist()] = geo_ftrs_ship_spawns_t1
-                
-            self.shipyard_model_samples += count
-
+            self._shipyard_prios[start_shipyard:end_shipyard] =  1 if self._current_shipyard_sample_pos==0 and not self._shipyard_buffer_filled else self._shipyard_prios.max()
+            self._current_shipyard_sample_pos += count
+            self._total_shipyard_samples += count
+            
 class NoisyLinear(nn.Module):
     def __init__(self, in_features, out_features, std_init=.001):
         super(NoisyLinear, self).__init__()
