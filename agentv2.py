@@ -771,8 +771,8 @@ class FeatureCalculator:
         cls.middle_heat_flipped = torch.flip(torch.as_tensor(cls.middle_heat, dtype=torch.float), dims=(0,))
         cls.ship_positions = torch.tensor((MAX_SHIPS,2), dtype=torch.int)
         cls.selector = np.ones((MAX_SHIPS, MAX_SHIPS), dtype=bool)
-        np.fill_diagonal(cls.selector, False)
-    
+        np.fill_diagonal(cls.selector, False)        
+        
     @classmethod
 #     @timer
     def update_tensors_v2(
@@ -796,8 +796,8 @@ class FeatureCalculator:
                 [halite[i:i+BOARD_SIZE] for i in 
                  range(0, len(halite), BOARD_SIZE)], 
                 dtype=torch.float) 
-        
-        current_ship_cargo[0] = sum([ship.halite for ship in cp.ships])                    
+        ship_halite = torch.tensor([ship.halite for ship in cp.ships], dtype=torch.float)
+        current_ship_cargo[0] = ship_halite.sum().item()  
         max_halite_cell = halite_tensor.max()
         min_halite_cell = halite_tensor.min()
         diff = max_halite_cell - min_halite_cell
@@ -810,13 +810,13 @@ class FeatureCalculator:
         shipyard_count = len(cp.shipyards)
         
         
+        
         if ship_count>0:        
             geometric_ship_ftrs[:, 0] = halite_tensor
             ship_positions_yx = np.array([(my_ship.position.y, my_ship.position.x) for my_ship in cp.ships])
-            shift_ship_positions_yx = np.array([
-                (BOARD_SIZE//2 - my_ship.position.y, 
-                 BOARD_SIZE//2 - my_ship.position.x) 
-                for my_ship in cp.ships])
+            shift_ship_positions_yx = BOARD_SIZE//2 - ship_positions_yx
+            ship_positions_xy = ship_positions_yx[:,[1,0]]
+            shift_ship_positions_xy = BOARD_SIZE//2 - ship_positions_xy
             
         if shipyard_count>0 and ship_count==0:
             geometric_shipyard_ftrs[:shipyard_count, 0] = halite_tensor
@@ -825,86 +825,95 @@ class FeatureCalculator:
         if shipyard_count>0 and ship_count>0:
             # SHIPYARD CHANNEL 1 - (SHIP HEATS)
             shipyard_positions_yx = np.array([(my_shipyard.position.y, my_shipyard.position.x) for my_shipyard in cp.shipyards])
-            shift_shipyard_positions_yx = np.array([
-                (BOARD_SIZE//2 - my_shipyard.position.y, 
-                 BOARD_SIZE//2 - my_shipyard.position.x) 
-                for my_shipyard in cp.shipyards])
+            shipyard_positions_xy = shipyard_positions_yx[:, [1,0]]
+            shift_shipyard_positions_yx = BOARD_SIZE//2 - shipyard_positions_yx
+            shift_shipyard_positions_xy = BOARD_SIZE//2 - shipyard_positions_xy
             
-            ending_ship_positions_yx = (
-                np.tile(ship_positions_yx, (shipyard_count,1)) +
-                shift_shipyard_positions_yx.repeat(ship_count,axis=0)
-            ).reshape(-1, 2)
+            ending_ship_positions_xy = (
+                np.tile(ship_positions_xy, (shipyard_count,1)) +
+                shift_shipyard_positions_xy.repeat(ship_count,axis=0)
+            ).reshape(-1, 2) % BOARD_SIZE
             
             heats = distance.cdist(
-                cls.spatial, ending_ship_positions_yx, 
+                cls.spatial, ending_ship_positions_xy, 
                 metric="cityblock").reshape(BOARD_SIZE, BOARD_SIZE, ship_count, shipyard_count)
             heats = heats.min(2)
             
             np.divide(1, heats + 1, out=heats)
-            flipped_heats = torch.flip(torch.as_tensor(heats, dtype=torch.float), dims=(0,)).transpose(2,0)
+            flipped_heats = torch.flip(torch.as_tensor(heats, dtype=torch.float), dims=(0,)).transpose(2,1).transpose(1,0)
             torch.mul(1 - remaining, flipped_heats, out=geometric_shipyard_ftrs[:shipyard_count, 0])
             geometric_shipyard_ftrs[:shipyard_count, 0].mul_(cp.halite / float(board.configuration.starting_halite))
 #             torch.mul(halite_tensor, geometric_shipyard_ftrs[:shipyard_count, 0], out=geometric_shipyard_ftrs[:shipyard_count, 0])
 
             
             ## SHIP CHANNEL 3 - (SHIPYARD HEATS)            
-            ending_shipyard_positions_yx = (
-                np.tile(shipyard_positions_yx, (ship_count,1)) +
-                shift_ship_positions_yx.repeat(shipyard_count,axis=0)
-            ).reshape(-1, 2)
+            ending_shipyard_positions_xy = (
+                np.tile(shipyard_positions_xy, (ship_count,1)) +
+                shift_ship_positions_xy.repeat(shipyard_count,axis=0)
+            ).reshape(-1, 2) % BOARD_SIZE
             
             heats = distance.cdist(
-                cls.spatial, ending_shipyard_positions_yx, 
+                cls.spatial, ending_shipyard_positions_xy, 
                 metric="cityblock").reshape(BOARD_SIZE, BOARD_SIZE, shipyard_count, ship_count)
             heats = heats.min(2)
             
             np.divide(1, heats + 1, out=heats)
-            flipped_heats = torch.flip(torch.as_tensor(heats, dtype=torch.float), dims=(0,)).transpose(2,0)
+            flipped_heats = torch.flip(torch.as_tensor(heats, dtype=torch.float), dims=(0,)).transpose(2,1).transpose(1,0)
             torch.mul(1 - remaining, flipped_heats, out=geometric_ship_ftrs[:ship_count, 2])
-            geometric_ship_ftrs[:ship_count, 2].mul_(cp.halite / float(board.configuration.starting_halite))
+            geometric_ship_ftrs[:ship_count, 2].mul_((ship_halite / max_halite_cell).unsqueeze(1).unsqueeze(1))
             
         if ship_count == 1:
             geometric_ship_ftrs[0, 1] = cls.middle_heat_flipped 
         elif ship_count>1:
-            ending_ship_positions_yx = (
-                np.tile(ship_positions_yx, (ship_count,1)) +
-                shift_ship_positions_yx.repeat(ship_count,axis=0)
-            ).reshape(-1, 2)
+            ending_ship_positions_xy = (
+                np.tile(ship_positions_xy, (ship_count,1)) +
+                shift_ship_positions_xy.repeat(ship_count,axis=0)
+            ).reshape(-1, 2) % BOARD_SIZE
             mask = torch.ones(ship_count**2, dtype=torch.bool)
             mask[range(0,ship_count**2,ship_count+1)] = 0
             heats = distance.cdist(
-                cls.spatial, ending_ship_positions_yx[mask], 
+                cls.spatial, ending_ship_positions_xy[mask], 
                 metric="cityblock").reshape(BOARD_SIZE, BOARD_SIZE, ship_count, ship_count-1)
             heats = heats.min(3)
 #             np.divide(1, heats + 1, out=heats)
-            flipped_heats = torch.flip(torch.as_tensor(heats, dtype=torch.float), dims=(1,)).transpose(2,0)
+            flipped_heats = torch.flip(torch.as_tensor(heats, dtype=torch.float), dims=(0,)).transpose(2,1).transpose(1,0)
             geometric_ship_ftrs[:ship_count, 1] = torch.where(torch.le(flipped_heats,2), flipped_heats-2, cls.middle_heat_flipped)
             
         if ship_count>0:
             for i, my_ship in enumerate(cp.ships):
                 shift = (BOARD_SIZE//2 - my_ship.position.x, my_ship.position.y - BOARD_SIZE//2) 
                 
-                if shipyard_count>0:
-                    geometric_ship_ftrs[
-                        i, 0,
-                        BOARD_SIZE - 1 - shipyard_positions_yx[:, 0],
-                        shipyard_positions_yx[:, 1]] = ((my_ship.halite-min_halite_cell)/diff.item())*(2/remaining)
-                         
-                geometric_ship_ftrs[
-                    i, 0, 
-                    BOARD_SIZE - 1 - ship_positions_yx[cls.selector[i, :ship_count], 0], 
-                    ship_positions_yx[cls.selector[i, :ship_count], 1]] = -2
+#                 geometric_ship_ftrs[
+#                     i, 0, 
+#                     BOARD_SIZE - 1 - ship_positions_yx[cls.selector[i, :ship_count], 0], 
+#                     ship_positions_yx[cls.selector[i, :ship_count], 1]] = -2
                 
-                geometric_ship_ftrs[i, 0] = torch.roll(
-                    geometric_ship_ftrs[i, 0], 
+                rolled_halite_tensor = torch.roll(
+                    halite_tensor, 
                     shifts=(shift[0], shift[1]), 
                     dims=(1,0))
                 
                 torch.mul(
-                    geometric_ship_ftrs[i, 0], 
-                    geometric_ship_ftrs[i, 1] if ship_count>1 else cls.middle_heat_flipped, 
+                    rolled_halite_tensor, 
+                    cls.middle_heat_flipped, 
                     out=geometric_ship_ftrs[i, 0])
                 
+                torch.mul(
+                    rolled_halite_tensor, 
+                    geometric_ship_ftrs[i, 1], 
+                    out=geometric_ship_ftrs[i, 1])
+                
+                torch.mul(
+                    rolled_halite_tensor, 
+                    geometric_ship_ftrs[i, 2], 
+                    out=geometric_ship_ftrs[i, 2])
+                
+#                 if shipyard_count>0:
+#                     geometric_ship_ftrs[
+#                         i, 0,
+#                         BOARD_SIZE - 1 - shipyard_positions_yx[:, 0],
+#                         shipyard_positions_yx[:, 1]] = ((my_ship.halite-min_halite_cell)/diff.item())*(2/remaining)
+                        
 #         geometric_ship_ftrs[:,0].mul_(remaining)
         
         ts_ftrs[:, 1] = cp.halite / float(board.configuration.starting_halite)
