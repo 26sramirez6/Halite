@@ -22,7 +22,7 @@ from kaggle_environments.envs.halite.helpers import * #@UnusedWildImport
 from kaggle_environments import make #@UnusedImport
 from random import choice #@UnusedImport
 
-EPISODE_STEPS = 50
+EPISODE_STEPS = 400
 MAX_EPISODES_MEMORY = 5000
 MAX_SHIPS = 1
 STARTING = 5000
@@ -32,8 +32,8 @@ PLAYERS = 1
 GAMMA = 0.6
 TRAIN_BATCH_SIZE = 48
 TARGET_MODEL_UPDATE = 500
-REWARD_GAME_COUNT_LEARNER = 5
-LEARNING_RATE = 0.01
+REWARD_GAME_COUNT_LEARNER = 10
+LEARNING_RATE = 0.005
 SHIP_CHANNELS = 2
 SHIPYARD_CHANNELS = 1
 MOMENTUM  = 0.9
@@ -42,7 +42,7 @@ SHIPYARD_ACTIONS = [None, ShipyardAction.SPAWN]
 SHIP_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST,ShipAction.CONVERT]
 SHIP_MOVE_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,ShipAction.WEST]
 TS_FTR_COUNT = 2 #1 + PLAYERS*2 
-GAME_COUNT = 1000
+GAME_COUNT = 10000
 TIMESTAMP = str(datetime.datetime.now()).replace(' ', '_').replace(':', '.').replace('-',"_")
 OUTPUT_LOGS = True
 PRINT_STATEMENTS = True
@@ -320,37 +320,37 @@ class AgentStateManager:
             
             self.save_loss(mini_batch_loss, True)
             
-        if self._current_shipyard_sample_pos > TRAIN_BATCH_SIZE:
-            geo_shipyard_ftrs_t0, \
-            ts_ftrs_shipyard_t0, \
-            geo_shipyard_ftrs_t1, \
-            ts_ftrs_shipyard_t1, \
-            shipyard_rewards, \
-            shipyard_actions, \
-            non_terminals, \
-            geo_ship_spawn_ftrs_t1, \
-            indices, \
-            weights = self.priority_sample(TRAIN_BATCH_SIZE, False)
-        
-            mini_batch_loss = self._train_model(
-                self.shipyard_cur_model, 
-                self.shipyard_tar_model,
-                self.shipyard_model_criterion, 
-                self.shipyard_model_optimizer, 
-                indices,
-                weights,
-                geo_shipyard_ftrs_t0,
-                ts_ftrs_shipyard_t0,
-                geo_shipyard_ftrs_t1,
-                ts_ftrs_shipyard_t1,
-                shipyard_rewards,
-                shipyard_actions,
-                non_terminals,
-                False,
-                None,
-                geo_ship_spawn_ftrs_t1)
-            
-            self.save_loss(mini_batch_loss, False)
+#         if self._current_shipyard_sample_pos > TRAIN_BATCH_SIZE:
+#             geo_shipyard_ftrs_t0, \
+#             ts_ftrs_shipyard_t0, \
+#             geo_shipyard_ftrs_t1, \
+#             ts_ftrs_shipyard_t1, \
+#             shipyard_rewards, \
+#             shipyard_actions, \
+#             non_terminals, \
+#             geo_ship_spawn_ftrs_t1, \
+#             indices, \
+#             weights = self.priority_sample(TRAIN_BATCH_SIZE, False)
+#         
+#             mini_batch_loss = self._train_model(
+#                 self.shipyard_cur_model, 
+#                 self.shipyard_tar_model,
+#                 self.shipyard_model_criterion, 
+#                 self.shipyard_model_optimizer, 
+#                 indices,
+#                 weights,
+#                 geo_shipyard_ftrs_t0,
+#                 ts_ftrs_shipyard_t0,
+#                 geo_shipyard_ftrs_t1,
+#                 ts_ftrs_shipyard_t1,
+#                 shipyard_rewards,
+#                 shipyard_actions,
+#                 non_terminals,
+#                 False,
+#                 None,
+#                 geo_ship_spawn_ftrs_t1)
+#             
+#             self.save_loss(mini_batch_loss, False)
         
         if self._current_ship_sample_pos > 0 and self.last_ship_update > TARGET_MODEL_UPDATE:
             self.update_target_model(self.ship_cur_model, self.ship_tar_model, True)
@@ -1051,10 +1051,10 @@ class ActionSelector:
             self._best_ship_actions[0] = 5
             converted_count = 1
             spawn_count = 0
-#         elif board.step==1:
-#             self._best_shipyard_actions[0] = 1
-#             converted_count = 0
-#             spawn_count = 1
+        elif board.step==1:
+            self._best_shipyard_actions[0] = 1
+            converted_count = 0
+            spawn_count = 1
         else:
             if (USE_EPSILON and (np.random.rand() < 
                 self.epsilon_end + 
@@ -1245,6 +1245,15 @@ class RewardEngine:
 #         cls.mine_weights = np.exp(np.array([-i/cls.mine_beta for i in range(EPISODE_STEPS)]))
 #         cls.deposit_weights = np.exp(np.array([-i/cls.deposit_beta for i in range(EPISODE_STEPS)]))
     
+    @staticmethod
+    def min_max_norm(arr):
+        max_ = arr.max(axis=0)
+        min_ = arr.min(axis=0)
+        diff = (max_ - min_) + 1e-6
+        ret = arr - min_
+        ret = ret * (1/diff)
+        return ret
+    
     @classmethod
     def update_score(cls, score):
         cls.scores[cls.score_index] = score
@@ -1252,16 +1261,23 @@ class RewardEngine:
         cls.weights[cls.score_index, 1] = cls.deposit_beta
         cls.weights[cls.score_index, 2] = cls.distance_beta
         if cls.score_index > REWARD_GAME_COUNT_LEARNER:
-            est = LinearRegression(normalize=True) 
-            est.fit(cls.weights[:cls.score_index], 
-                    cls.scores[:cls.score_index])
+            est = LinearRegression(fit_intercept=False) 
+#             if cls.score_index == REWARD_GAME_COUNT_LEARNER+1:
+#                 est.fit(cls.weights[cls.score_index-5:cls.score_index], 
+#                         cls.scores[cls.score_index-5:cls.score_index])
+#             else:
+#                 est.fit(cls.min_max_norm(cls.weights[cls.score_index-5:cls.score_index]), 
+#                         cls.min_max_norm(cls.scores[cls.score_index-5:cls.score_index]))
+            est.fit(cls.weights[cls.score_index-5:cls.score_index], 
+                    cls.min_max_norm(cls.scores[cls.score_index-5:cls.score_index]))
             print("reward weight update:", est.coef_, file=LOG)
             print("reward weight update:", est.coef_)
             
             
-            cls.mine_beta += np.clip(est.coef_[0], -10, 10)
-            cls.deposit_beta += np.clip(est.coef_[1], -10, 10)
-            cls.distance_beta += np.clip(est.coef_[2], -.025, .025)
+            cls.mine_beta += np.clip(est.coef_[0], -1, 1)
+            cls.deposit_beta += np.clip(est.coef_[1], -1, 1)
+            cls.distance_beta += np.clip(est.coef_[2], -.005, .005)
+            
             
             print("current weights:", [cls.mine_beta, cls.deposit_beta, cls.distance_beta], file=LOG)
             print("current weights:", [cls.mine_beta, cls.deposit_beta, cls.distance_beta])
@@ -1598,7 +1614,7 @@ while i < GAME_COUNT:
     env.reset(PLAYERS)
     np.random.shuffle(agents)
     active_agents = set([j for j, el in enumerate(agents) if el in (agent,)])
-    print("starting game {0} with agent order: {1}".format(i, agents))
+    #print("starting game {0} with agent order: {1}".format(i, agents))
     print("starting game {0} with agent order: {1}".format(i, agents), file=LOG)
     active_agent_managers = {j:asm for j,asm in agent_managers.items() if j in active_agents}
     
