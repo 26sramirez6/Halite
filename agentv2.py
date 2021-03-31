@@ -16,22 +16,24 @@ import torch.nn.functional as F #@UnusedImport
 import datetime
 import matplotlib.pyplot as plt
 from scipy.spatial import distance
+from sklearn.linear_model import LinearRegression
 from itertools import permutations, product #@UnusedImport
 from kaggle_environments.envs.halite.helpers import * #@UnusedWildImport
 from kaggle_environments import make #@UnusedImport
 from random import choice #@UnusedImport
 
-EPISODE_STEPS = 400
+EPISODE_STEPS = 50
 MAX_EPISODES_MEMORY = 5000
 MAX_SHIPS = 1
 STARTING = 5000
 CONVERT_COST = 500
 BOARD_SIZE = 11
 PLAYERS = 1
-GAMMA = 0.8
+GAMMA = 0.6
 TRAIN_BATCH_SIZE = 48
 TARGET_MODEL_UPDATE = 500
-LEARNING_RATE = 0.001
+REWARD_GAME_COUNT_LEARNER = 5
+LEARNING_RATE = 0.01
 SHIP_CHANNELS = 2
 SHIPYARD_CHANNELS = 1
 MOMENTUM  = 0.9
@@ -1230,16 +1232,42 @@ class ActionSelector:
 class RewardEngine:
     @classmethod
     def init_weights(cls):
-        cls.mined_reward_weights = torch.tensor([1] + [-.25]*(PLAYERS-1), dtype=torch.float).to(DEVICE) #@UndefinedVariable
-        cls.deposited_reward_weights = torch.tensor([1] + [-.1]*(PLAYERS-1), dtype=torch.float).to(DEVICE) #@UndefinedVariable
+#         cls.mined_reward_weights = torch.tensor([1] + [-.25]*(PLAYERS-1), dtype=torch.float).to(DEVICE) #@UndefinedVariable
+#         cls.deposited_reward_weights = torch.tensor([1] + [-.1]*(PLAYERS-1), dtype=torch.float).to(DEVICE) #@UndefinedVariable
         cls.reward_step = 1 / EPISODE_STEPS
         
-        cls.mine_beta = EPISODE_STEPS / 4. # smaller negative makes curve less linear
+        cls.mine_beta = EPISODE_STEPS / 2. # smaller negative makes curve less linear
         cls.deposit_beta = EPISODE_STEPS / 2.
-        
+        cls.distance_beta = .025
+        cls.scores = np.zeros((GAME_COUNT*1,), dtype=np.float64) #1=number of agents
+        cls.weights = np.zeros((GAME_COUNT*1,3), dtype=np.float64)
+        cls.score_index = 0
 #         cls.mine_weights = np.exp(np.array([-i/cls.mine_beta for i in range(EPISODE_STEPS)]))
 #         cls.deposit_weights = np.exp(np.array([-i/cls.deposit_beta for i in range(EPISODE_STEPS)]))
-        
+    
+    @classmethod
+    def update_score(cls, score):
+        cls.scores[cls.score_index] = score
+        cls.weights[cls.score_index, 0] = cls.mine_beta
+        cls.weights[cls.score_index, 1] = cls.deposit_beta
+        cls.weights[cls.score_index, 2] = cls.distance_beta
+        if cls.score_index > REWARD_GAME_COUNT_LEARNER:
+            est = LinearRegression(normalize=True) 
+            est.fit(cls.weights[:cls.score_index], 
+                    cls.scores[:cls.score_index])
+            print("reward weight update:", est.coef_, file=LOG)
+            print("reward weight update:", est.coef_)
+            
+            
+            cls.mine_beta += np.clip(est.coef_[0], -10, 10)
+            cls.deposit_beta += np.clip(est.coef_[1], -10, 10)
+            cls.distance_beta += np.clip(est.coef_[2], -.025, .025)
+            
+            print("current weights:", [cls.mine_beta, cls.deposit_beta, cls.distance_beta], file=LOG)
+            print("current weights:", [cls.mine_beta, cls.deposit_beta, cls.distance_beta])
+            
+        cls.score_index += 1
+            
     def __init__(self):        
 #         self._ships_to_shipyards = {}
         self._shipyards_to_ships = {}        
@@ -1283,7 +1311,7 @@ class RewardEngine:
         rewards = {ship.id: 
             np.clip(mine_weight*(current_halite_cargo[ship.id] - ship.halite)/max_halite_mineable, 0, 1) + # diff halite cargo
 #             np.clip(current_board.ships[ship.id].cell.halite/(max_halite*4), 0, .25) +
-            np.clip(int(prior_distances[ship.id].min() > current_distances[ship.id].min())*int(ship.halite>0)*.025, 0, .025) + 
+            np.clip(self.distance_beta*(int(prior_distances[ship.id].min() > current_distances[ship.id].min())*int(ship.halite>0)), 0, 1) + 
             np.clip(deposit_weight*(ship.halite - current_halite_cargo[ship.id])/max_halite, 0, 1) # diff halite deposited
 #             int(ship.halite==current_halite_cargo[ship.id] and ship.next_action==None)*-.05 # inactivity
             if ship.id in retained_ships else 0 
@@ -1581,7 +1609,8 @@ while i < GAME_COUNT:
     for asm in active_agent_managers.values():
         print("agent {0} mean total reward: {1}, total halite: {2}".format(asm.player_id, asm.compute_total_reward_post_game(), asm.current_halite))
         print("agent {0} mean total reward: {1}, total halite: {2}".format(asm.player_id, asm.compute_total_reward_post_game(), asm.current_halite), file=LOG)
-    
+        RewardEngine.update_score(asm.current_halite)
+        
     if OUTPUT_LOGS:
         outputter.output_logs(active_agent_managers, i)
         print("outputted data files")
@@ -1589,5 +1618,6 @@ while i < GAME_COUNT:
     for asm in agent_managers.values():
         asm.game_id += 1
         asm.post_game_state_handle()
+
         
     i += 1
