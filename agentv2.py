@@ -29,10 +29,10 @@ STARTING = 5000
 CONVERT_COST = 500
 BOARD_SIZE = 11
 PLAYERS = 1
-GAMMA = 0.6
+GAMMA = 0.9
 TRAIN_BATCH_SIZE = 48
 TARGET_MODEL_UPDATE = 500
-REWARD_GAME_COUNT_LEARNER = 10
+REWARD_GAME_COUNT_LEARNER = 100
 LEARNING_RATE = 0.005
 SHIP_CHANNELS = 2
 SHIPYARD_CHANNELS = 1
@@ -44,7 +44,7 @@ SHIP_MOVE_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,Shi
 TS_FTR_COUNT = 2 #1 + PLAYERS*2 
 GAME_COUNT = 10000
 TIMESTAMP = str(datetime.datetime.now()).replace(' ', '_').replace(':', '.').replace('-',"_")
-OUTPUT_LOGS = True
+OUTPUT_LOGS = False
 PRINT_STATEMENTS = True
 TRAIN_MODELS = True
 USE_EPSILON = False
@@ -1230,6 +1230,22 @@ class ActionSelector:
         self._reward_engine.reset_state()
 
 class RewardEngine:
+    
+    MINE_TIME_BETA_MIN = EPISODE_STEPS / 6.
+    MINE_TIME_BETA_MAX = EPISODE_STEPS
+    
+    DEPOSIT_TIME_BETA_MIN = EPISODE_STEPS / 6.
+    DEPOSIT_TIME_BETA_MAX = EPISODE_STEPS
+    
+    DISTANCE_TIME_BETA_MIN = 0
+    DISTANCE_TIME_BETA_MAX = .5    
+    
+    DEPOSIT_BETA_MIN = 0
+    DEPOSIT_BETA_MAX = 1
+    
+    MINE_BETA_MIN = 0
+    MINE_BETA_MAX = 1    
+    
     @classmethod
     def init_weights(cls):
 #         cls.mined_reward_weights = torch.tensor([1] + [-.25]*(PLAYERS-1), dtype=torch.float).to(DEVICE) #@UndefinedVariable
@@ -1261,15 +1277,15 @@ class RewardEngine:
         cls.weights[cls.score_index, 1] = cls.deposit_beta
         cls.weights[cls.score_index, 2] = cls.distance_beta
         if cls.score_index > REWARD_GAME_COUNT_LEARNER:
-            est = LinearRegression(fit_intercept=False) 
+            est = LinearRegression(fit_intercept=True) 
 #             if cls.score_index == REWARD_GAME_COUNT_LEARNER+1:
 #                 est.fit(cls.weights[cls.score_index-5:cls.score_index], 
 #                         cls.scores[cls.score_index-5:cls.score_index])
 #             else:
 #                 est.fit(cls.min_max_norm(cls.weights[cls.score_index-5:cls.score_index]), 
 #                         cls.min_max_norm(cls.scores[cls.score_index-5:cls.score_index]))
-            est.fit(cls.weights[cls.score_index-5:cls.score_index], 
-                    cls.min_max_norm(cls.scores[cls.score_index-5:cls.score_index]))
+            est.fit(cls.min_max_norm(cls.weights[cls.score_index-(REWARD_GAME_COUNT_LEARNER-1):cls.score_index]), 
+                    cls.min_max_norm(cls.scores[cls.score_index-(REWARD_GAME_COUNT_LEARNER-1):cls.score_index]))
             print("reward weight update:", est.coef_, file=LOG)
             print("reward weight update:", est.coef_)
             
@@ -1278,6 +1294,14 @@ class RewardEngine:
             cls.deposit_beta += np.clip(est.coef_[1], -1, 1)
             cls.distance_beta += np.clip(est.coef_[2], -.005, .005)
             
+            cls.distance_beta = np.clip(cls.distance_beta, cls.DISTANCE_BETA_MIN, cls.DISTANCE_BETA_MAX)
+            cls.distance_time_beta = np.clip(cls.distance_time_beta, cls.DISTANCE_TIME_BETA_MIN, cls.DISTANCE_TIME_BETA_MAX)
+            
+            cls.mine_beta = np.clip(cls.mine_beta, cls.MINE_BETA_MIN, cls.MINE_BETA_MAX)
+            cls.mine_time_beta = np.clip(cls.mine_time_beta, cls.MINE_TIME_BETA_MIN, cls.MINE_TIME_BETA_MAX)
+            
+            cls.deposit_beta = np.clip(cls.deposit_beta, cls.DEPOSIT_BETA_MIN, cls.DEPOSIT_BETA_MAX)
+            cls.deposit_time_beta = np.clip(cls.deposit_time_beta, cls.DEPOSIT_TIME_BETA_MIN, cls.DEPOSIT_TIME_BETA_MAX)
             
             print("current weights:", [cls.mine_beta, cls.deposit_beta, cls.distance_beta], file=LOG)
             print("current weights:", [cls.mine_beta, cls.deposit_beta, cls.distance_beta])
