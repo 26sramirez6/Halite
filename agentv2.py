@@ -1239,9 +1239,9 @@ class RewardEngine:
     DEPOSIT_TIME_BETA_MAX = EPISODE_STEPS
     
     DISTANCE_BETA_MIN = 0
-    DISTANCE_BETA_MAX = .5    
+    DISTANCE_BETA_MAX = .25    
     
-    DEPOSIT_BETA_MIN = 0
+    DEPOSIT_BETA_MIN = .75
     DEPOSIT_BETA_MAX = 2
     
     MINE_BETA_MIN = 0
