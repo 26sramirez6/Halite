@@ -86,6 +86,7 @@ class AgentStateManager:
             ship_model_optimizer, 
             shipyard_model_optimizer):
         self.current_halite = 0
+        self.current_cargo = 0
         self.player_id = player_id
         self.game_id = 0
         self.prior_board = None
@@ -1237,29 +1238,28 @@ class RewardEngine:
     DEPOSIT_TIME_BETA_MIN = EPISODE_STEPS / 6.
     DEPOSIT_TIME_BETA_MAX = EPISODE_STEPS
     
-    DISTANCE_TIME_BETA_MIN = 0
-    DISTANCE_TIME_BETA_MAX = .5    
+    DISTANCE_BETA_MIN = 0
+    DISTANCE_BETA_MAX = .5    
     
     DEPOSIT_BETA_MIN = 0
-    DEPOSIT_BETA_MAX = 1
+    DEPOSIT_BETA_MAX = 2
     
     MINE_BETA_MIN = 0
-    MINE_BETA_MAX = 1    
+    MINE_BETA_MAX = 2
     
     @classmethod
     def init_weights(cls):
-#         cls.mined_reward_weights = torch.tensor([1] + [-.25]*(PLAYERS-1), dtype=torch.float).to(DEVICE) #@UndefinedVariable
-#         cls.deposited_reward_weights = torch.tensor([1] + [-.1]*(PLAYERS-1), dtype=torch.float).to(DEVICE) #@UndefinedVariable
         cls.reward_step = 1 / EPISODE_STEPS
         
-        cls.mine_beta = EPISODE_STEPS / 2. # smaller negative makes curve less linear
-        cls.deposit_beta = EPISODE_STEPS / 2.
+        cls.mine_beta = 1.
+        cls.deposit_beta = 1.
         cls.distance_beta = .025
+        cls.mine_time_beta = EPISODE_STEPS / 2. # smaller negative makes curve less linear
+        cls.deposit_time_beta = EPISODE_STEPS / 2.
+        
         cls.scores = np.zeros((GAME_COUNT*1,), dtype=np.float64) #1=number of agents
-        cls.weights = np.zeros((GAME_COUNT*1,3), dtype=np.float64)
+        cls.weights = np.zeros((GAME_COUNT*1,5), dtype=np.float64)
         cls.score_index = 0
-#         cls.mine_weights = np.exp(np.array([-i/cls.mine_beta for i in range(EPISODE_STEPS)]))
-#         cls.deposit_weights = np.exp(np.array([-i/cls.deposit_beta for i in range(EPISODE_STEPS)]))
     
     @staticmethod
     def min_max_norm(arr):
@@ -1276,35 +1276,41 @@ class RewardEngine:
         cls.weights[cls.score_index, 0] = cls.mine_beta
         cls.weights[cls.score_index, 1] = cls.deposit_beta
         cls.weights[cls.score_index, 2] = cls.distance_beta
+        cls.weights[cls.score_index, 3] = cls.mine_time_beta
+        cls.weights[cls.score_index, 4] = cls.deposit_time_beta
         if cls.score_index > REWARD_GAME_COUNT_LEARNER:
             est = LinearRegression(fit_intercept=True) 
-#             if cls.score_index == REWARD_GAME_COUNT_LEARNER+1:
-#                 est.fit(cls.weights[cls.score_index-5:cls.score_index], 
-#                         cls.scores[cls.score_index-5:cls.score_index])
-#             else:
-#                 est.fit(cls.min_max_norm(cls.weights[cls.score_index-5:cls.score_index]), 
-#                         cls.min_max_norm(cls.scores[cls.score_index-5:cls.score_index]))
             est.fit(cls.min_max_norm(cls.weights[cls.score_index-(REWARD_GAME_COUNT_LEARNER-1):cls.score_index]), 
                     cls.min_max_norm(cls.scores[cls.score_index-(REWARD_GAME_COUNT_LEARNER-1):cls.score_index]))
             print("reward weight update:", est.coef_, file=LOG)
             print("reward weight update:", est.coef_)
             
             
-            cls.mine_beta += np.clip(est.coef_[0], -1, 1)
-            cls.deposit_beta += np.clip(est.coef_[1], -1, 1)
+            cls.mine_beta += np.clip(est.coef_[0], -.1, .1)
+            cls.deposit_beta += np.clip(est.coef_[1], -.1, .1)
             cls.distance_beta += np.clip(est.coef_[2], -.005, .005)
+            cls.mine_time_beta += np.clip(est.coef_[3], -1., 1.)
+            cls.deposit_time_beta += np.clip(est.coef_[4], -1., 1.)
             
             cls.distance_beta = np.clip(cls.distance_beta, cls.DISTANCE_BETA_MIN, cls.DISTANCE_BETA_MAX)
-            cls.distance_time_beta = np.clip(cls.distance_time_beta, cls.DISTANCE_TIME_BETA_MIN, cls.DISTANCE_TIME_BETA_MAX)
             
             cls.mine_beta = np.clip(cls.mine_beta, cls.MINE_BETA_MIN, cls.MINE_BETA_MAX)
             cls.mine_time_beta = np.clip(cls.mine_time_beta, cls.MINE_TIME_BETA_MIN, cls.MINE_TIME_BETA_MAX)
             
             cls.deposit_beta = np.clip(cls.deposit_beta, cls.DEPOSIT_BETA_MIN, cls.DEPOSIT_BETA_MAX)
             cls.deposit_time_beta = np.clip(cls.deposit_time_beta, cls.DEPOSIT_TIME_BETA_MIN, cls.DEPOSIT_TIME_BETA_MAX)
+        else:
+            rands = np.random.randn(5) / 100
+            cls.mine_beta += np.clip(rands[0], -.001, .001)
+            cls.deposit_beta += np.clip(rands[1], -.001, .001)
+            cls.distance_beta += np.clip(rands[2], -.005, .005)
+            cls.mine_time_beta += np.clip(rands[3], -1., 1.)
+            cls.deposit_time_beta += np.clip(rands[4], -1., 1.)
             
-            print("current weights:", [cls.mine_beta, cls.deposit_beta, cls.distance_beta], file=LOG)
-            print("current weights:", [cls.mine_beta, cls.deposit_beta, cls.distance_beta])
+        print("weights:", [cls.mine_beta,cls.deposit_beta,cls.distance_beta,
+                           cls.mine_time_beta,cls.deposit_time_beta], file=LOG)
+        print("weights:", [cls.mine_beta,cls.deposit_beta,cls.distance_beta,
+                           cls.mine_time_beta,cls.deposit_time_beta])
             
         cls.score_index += 1
             
@@ -1342,8 +1348,8 @@ class RewardEngine:
         ships_lost_from_collision = prior_ships_set.difference(ships_converted).difference(current_ships_set)
         retained_ships = current_ships_set.intersection(prior_ships_set)
 #         deposit_weight = (1 / (1 - current_board.step*self.reward_step))
-        mine_weight = np.exp(-current_board.step/self.mine_beta)
-        deposit_weight = 1-np.exp(-current_board.step/self.deposit_beta)
+        mine_weight = self.mine_beta*(np.exp(-current_board.step/self.mine_time_beta))
+        deposit_weight = self.deposit_beta*(1-np.exp(-current_board.step/self.deposit_time_beta))
         
         non_terminal_ships[[my_ship_ids[sid] for sid in ships_converted.union(ships_lost_from_collision)]] = 0
         max_halite = float(max(prior_board.observation['halite']))
@@ -1444,6 +1450,7 @@ def agent(obs, config):
     asm.set_prior_board(current_board)
     asm.in_game_episodes_seen += 1
     asm.current_halite = current_board.current_player.halite
+    asm.current_cargo = sum([ship.halite for ship in current_board.current_player.ships])
     return current_board.current_player.next_actions
 
 
@@ -1647,8 +1654,8 @@ while i < GAME_COUNT:
     print("completed game {0}".format(i), file=LOG)
     
     for asm in active_agent_managers.values():
-        print("agent {0} mean total reward: {1}, total halite: {2}".format(asm.player_id, asm.compute_total_reward_post_game(), asm.current_halite))
-        print("agent {0} mean total reward: {1}, total halite: {2}".format(asm.player_id, asm.compute_total_reward_post_game(), asm.current_halite), file=LOG)
+        print("agent {0} mean total reward: {1}, total halite: {2}, total cargo: {3}".format(asm.player_id, asm.compute_total_reward_post_game(), asm.current_halite, asm.current_cargo))
+        print("agent {0} mean total reward: {1}, total halite: {2}, total cargo: {3}".format(asm.player_id, asm.compute_total_reward_post_game(), asm.current_halite, asm.current_cargo), file=LOG)
         RewardEngine.update_score(asm.current_halite)
         
     if OUTPUT_LOGS:
