@@ -44,7 +44,9 @@ SHIP_MOVE_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,Shi
 TS_FTR_COUNT = 2 #1 + PLAYERS*2 
 GAME_COUNT = 10000
 TIMESTAMP = str(datetime.datetime.now()).replace(' ', '_').replace(':', '.').replace('-',"_")
-OUTPUT_LOGS = False
+OUTPUT_HTML = False
+OUTPUT_REWARDS = False
+OUTPUT_HALITE = True
 PRINT_STATEMENTS = True
 TRAIN_MODELS = True
 USE_EPSILON = False
@@ -1475,14 +1477,18 @@ class Outputter:
         self._shipyard_losses = torch.zeros(
             0, 
             dtype=torch.float).to(DEVICE) #@UndefinedVariable
+        
+        self._halite_deposits = torch.zeros(
+            GAME_COUNT*PLAYERS, 
+            dtype=torch.float).to(DEVICE) #@UndefinedVariable
+        self._game_index = 0
             
     def _moving_average(self, a, n) :
         ret = np.cumsum(a, dtype=float)
         ret[n:] = ret[n:] - ret[:-n]
         return ret[n - 1:] / n
 
-    def output_logs(self, agent_managers, game_id):        
-        append_p = ""
+    def output_reward_figs(self, agent_managers, game_id):
         for asm in agent_managers.values():
             self._all_rewards = torch.cat((self._all_rewards, asm.episode_rewards))
             start_ship = asm._total_ship_reward_idx
@@ -1520,17 +1526,36 @@ class Outputter:
         axis[1, 0].plot(range(len(self._ship_losses)), np.array(self._ship_losses), label="Ship Model Loss", color="red")
         axis[1, 1].plot(range(len(self._shipyard_losses)), np.array(self._shipyard_losses), label="Shipyard Model Loss", color="green")
         
-#         axis[0].legend()
-#         axis[1].legend()
-#         axis[2].legend()
         axis[0, 0].grid()
         axis[0, 1].grid()
         axis[1, 0].grid()
         axis[1, 1].grid()
         fig.savefig("{0}/rewards.png".format(TIMESTAMP))
         plt.close(fig)
+        
+    def output_html(self, game_id):
+        append_p = ""
         with open("{0}/{1}_{0}g{2}.html".format(TIMESTAMP, append_p, game_id), "w") as f:
             f.write(env.render(mode="html", width=800, height=600))
+    
+    def output_halite_figs(self, agent_managers):
+        for asm in agent_managers.values():
+            self._halite_deposits[self._game_index] = asm.current_halite
+            self._game_index += 1
+        fig, axis = plt.subplots(figsize=(60, 20))
+        arr = np.array(self._halite_deposits[:self._game_index])
+        ma1_len = 50
+        ma2_len = 250
+        ma3_len = 500
+        ma1 = self._moving_average(arr, ma1_len)
+        ma2 = self._moving_average(arr, ma2_len)
+        ma3 = self._moving_average(arr, ma3_len)
+        axis.plot(range(len(arr)), arr, label="Total Halite")
+        axis.plot(range(ma1_len,len(ma1)+ma1_len), ma1, label="MA{0}".format(ma1_len))
+        axis.plot(range(ma2_len,len(ma2)+ma2_len), ma2, label="MA{0}".format(ma2_len))
+        axis.plot(range(ma3_len,len(ma3)+ma3_len), ma3, label="MA{0}".format(ma3_len))
+        fig.savefig("{0}/halite.png".format(TIMESTAMP))
+        plt.close(fig)
 
     
 config = {
@@ -1658,9 +1683,15 @@ while i < GAME_COUNT:
         print("agent {0} mean total reward: {1}, total halite: {2}, total cargo: {3}".format(asm.player_id, asm.compute_total_reward_post_game(), asm.current_halite, asm.current_cargo), file=LOG)
         RewardEngine.update_score(asm.current_halite)
         
-    if OUTPUT_LOGS:
-        outputter.output_logs(active_agent_managers, i)
-        print("outputted data files")
+    if OUTPUT_HTML:
+        outputter.output_html(i)
+        print("outputted html files")
+    if OUTPUT_REWARDS:
+        outputter.output_reward_figs(active_agent_managers)
+        print("outputted reward files")
+    if OUTPUT_HALITE:
+        outputter.output_halite_figs(active_agent_managers)
+        print("outputted halite files")
         
     for asm in agent_managers.values():
         asm.game_id += 1
