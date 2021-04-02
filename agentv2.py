@@ -32,7 +32,7 @@ PLAYERS = 1
 GAMMA = 0.9
 TRAIN_BATCH_SIZE = 48
 TARGET_MODEL_UPDATE = 500
-REWARD_GAME_COUNT_LEARNER = 100
+REWARD_GAME_COUNT_LEARNER = 300
 LEARNING_RATE = 0.005
 SHIP_CHANNELS = 2
 SHIPYARD_CHANNELS = 1
@@ -1240,9 +1240,13 @@ class RewardEngine:
     DEPOSIT_TIME_BETA_MIN = EPISODE_STEPS / 6.
     DEPOSIT_TIME_BETA_MAX = EPISODE_STEPS
     
+    DISTANCE_TIME_BETA_MIN = EPISODE_STEPS / 6.
+    DISTANCE_TIME_BETA_MAX = EPISODE_STEPS
+
     DISTANCE_BETA_MIN = 0
     DISTANCE_BETA_MAX = .25    
     
+
     DEPOSIT_BETA_MIN = .75
     DEPOSIT_BETA_MAX = 2
     
@@ -1258,9 +1262,9 @@ class RewardEngine:
         cls.distance_beta = .025
         cls.mine_time_beta = EPISODE_STEPS / 2. # smaller negative makes curve less linear
         cls.deposit_time_beta = EPISODE_STEPS / 2.
-        
+        cls.distance_time_beta = EPISODE_STEPS / 2.
         cls.scores = np.zeros((GAME_COUNT*1,), dtype=np.float64) #1=number of agents
-        cls.weights = np.zeros((GAME_COUNT*1,5), dtype=np.float64)
+        cls.weights = np.zeros((GAME_COUNT*1,6), dtype=np.float64)
         cls.score_index = 0
     
     @staticmethod
@@ -1280,6 +1284,7 @@ class RewardEngine:
         cls.weights[cls.score_index, 2] = cls.distance_beta
         cls.weights[cls.score_index, 3] = cls.mine_time_beta
         cls.weights[cls.score_index, 4] = cls.deposit_time_beta
+        cls.weights[cls.score_index, 5] = cls.distance_time_beta
         if cls.score_index > REWARD_GAME_COUNT_LEARNER:
             est = LinearRegression(fit_intercept=True) 
             est.fit(cls.min_max_norm(cls.weights[cls.score_index-(REWARD_GAME_COUNT_LEARNER-1):cls.score_index]), 
@@ -1288,11 +1293,12 @@ class RewardEngine:
             print("reward weight update:", est.coef_)
             
             
-            cls.mine_beta += np.clip(est.coef_[0], -.1, .1)
-            cls.deposit_beta += np.clip(est.coef_[1], -.1, .1)
-            cls.distance_beta += np.clip(est.coef_[2], -.005, .005)
+            cls.mine_beta += np.clip(est.coef_[0], -.01, .01)
+            cls.deposit_beta += np.clip(est.coef_[1], -.01, .01)
+            cls.distance_beta += np.clip(est.coef_[2], -.0005, .0005)
             cls.mine_time_beta += np.clip(est.coef_[3], -1., 1.)
             cls.deposit_time_beta += np.clip(est.coef_[4], -1., 1.)
+            cls.distance_time_beta += np.clip(est.coef[5], -1., 1.)
             
             cls.distance_beta = np.clip(cls.distance_beta, cls.DISTANCE_BETA_MIN, cls.DISTANCE_BETA_MAX)
             
@@ -1301,18 +1307,19 @@ class RewardEngine:
             
             cls.deposit_beta = np.clip(cls.deposit_beta, cls.DEPOSIT_BETA_MIN, cls.DEPOSIT_BETA_MAX)
             cls.deposit_time_beta = np.clip(cls.deposit_time_beta, cls.DEPOSIT_TIME_BETA_MIN, cls.DEPOSIT_TIME_BETA_MAX)
+            cls.distance_time_beta = np.clip(cls.distance_time_beta, cls.DISTANCE_TIME_BETA_MIN, cls.DISTANCE_TIME_BETA_MAX)
         else:
-            rands = np.random.randn(5) / 100
+            rands = np.random.randn(6) / 100
             cls.mine_beta += np.clip(rands[0], -.001, .001)
             cls.deposit_beta += np.clip(rands[1], -.001, .001)
-            cls.distance_beta += np.clip(rands[2], -.005, .005)
+            cls.distance_beta += np.clip(rands[2], -.0005, .0005)
             cls.mine_time_beta += np.clip(rands[3], -1., 1.)
             cls.deposit_time_beta += np.clip(rands[4], -1., 1.)
-            
+            cls.distance_time_beta += np.clip(rands[5], -1., 1.)
         print("weights:", [cls.mine_beta,cls.deposit_beta,cls.distance_beta,
-                           cls.mine_time_beta,cls.deposit_time_beta], file=LOG)
+                           cls.mine_time_beta,cls.deposit_time_beta,cls.distance_time_beta], file=LOG)
         print("weights:", [cls.mine_beta,cls.deposit_beta,cls.distance_beta,
-                           cls.mine_time_beta,cls.deposit_time_beta])
+                           cls.mine_time_beta,cls.deposit_time_beta,cls.distance_time_beta])
             
         cls.score_index += 1
             
@@ -1353,14 +1360,15 @@ class RewardEngine:
         mine_weight = self.mine_beta*(np.exp(-current_board.step/self.mine_time_beta))
         deposit_weight = self.deposit_beta*(1-np.exp(-current_board.step/self.deposit_time_beta))
         
+        distance_weight = self.distance_beta*(1-np.exp(-current_board.step/self.distance_time_beta))
         non_terminal_ships[[my_ship_ids[sid] for sid in ships_converted.union(ships_lost_from_collision)]] = 0
         max_halite = float(max(prior_board.observation['halite']))
                 
         rewards = {ship.id: 
             np.clip(mine_weight*(current_halite_cargo[ship.id] - ship.halite)/max_halite_mineable, 0, 1) + # diff halite cargo
 #             np.clip(current_board.ships[ship.id].cell.halite/(max_halite*4), 0, .25) +
-            np.clip(self.distance_beta*(int(prior_distances[ship.id].min() > current_distances[ship.id].min())*int(ship.halite>0)), 0, 1) + 
-            np.clip(deposit_weight*(ship.halite - current_halite_cargo[ship.id])/max_halite, 0, 1) # diff halite deposited
+            np.clip(distance_weight*(int(prior_distances[ship.id].min() > current_distances[ship.id].min())*int(ship.halite>0)), 0, 1) + 
+            np.clip(deposit_weight*(ship.halite - current_halite_cargo[ship.id])/max_halite, 0, 2) # diff halite deposited
 #             int(ship.halite==current_halite_cargo[ship.id] and ship.next_action==None)*-.05 # inactivity
             if ship.id in retained_ships else 0 
             for ship in prior_ships_dict.values()}
