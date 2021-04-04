@@ -78,23 +78,35 @@ struct Board {
 		}
 
 		Ship p0_start_ship;
-		index_to_point(p0_starting_index, p0_start_ship.x, p0_start_ship.y);
+		indexToPoint(p0_starting_index, p0_start_ship.x, p0_start_ship.y);
 		m_ships.emplace_back(p0_start_ship);
 	}
 
-	static inline unsigned point_to_index(uint8_t x, uint8_t y) {
+	static inline unsigned pointToIndex(uint8_t x, uint8_t y) {
 		return (Config::size - y - 1) * Config::size + x;
 	}
 
-	static inline void index_to_point(const unsigned _index, uint8_t& x_, uint8_t& y_) {
+	static inline void indexToPoint(const unsigned _index, uint8_t& x_, uint8_t& y_) {
 		auto dv = std::div(static_cast<int>(_index), static_cast<int>(Config::size));
 		x_ = dv.rem;
 		y_ = Config::size - dv.quot - 1;
 	}
 
+	inline double getPlayerHalite() { return m_p0_halite; }
+	inline std::vector<float>& getHaliteGrid() { return m_halite; }
+	inline std::vector<Ship>& getShips() { return m_ships; }
+	inline std::vector<Shipyard>& getShipyards() { return m_shipyards; }
+	inline bool pointHasShip(uint8_t x, uint8_t y) { return m_has_ship[pointToIndex(x, y)]; }
+	inline bool pointHasShipyard(uint8_t x, uint8_t y) { return m_has_shipyard[pointToIndex(x, y)]; }
+	inline bool indexHasShip(unsigned index) { return m_has_ship[index]; }
+	inline bool indexHasShipyard(unsigned index) { return m_has_shipyard[index]; }
+	inline unsigned getShipCount() { return m_ships.size(); }
+	inline unsigned getShipyardCount() { return m_shipyards.size(); }
+	inline unsigned getStep() { return m_step; }
+
 	inline void step() {
 		for (auto& ship : m_ships) {
-			const unsigned index = point_to_index(ship.x, ship.y);
+			const unsigned index = pointToIndex(ship.x, ship.y);
 			switch (ship.action) {
 			case ShipAction::NONE:
 				const float delta = m_halite[index] * Config::collect_rate;
@@ -110,22 +122,22 @@ struct Board {
 			case ShipAction::MOVE_NORTH:
 				ship.y = (ship.y == Config::size - 1) ? 0 : ship.y + 1;
 				m_has_ship[index] = false;
-				m_has_ship[point_to_index(ship.x, ship.y)] = true;
+				m_has_ship[pointToIndex(ship.x, ship.y)] = true;
 				break;
 			case ShipAction::MOVE_EAST:
 				ship.x = (ship.x == Config::size - 1) ? 0 : ship.x + 1;
 				m_has_ship[index] = false;
-				m_has_ship[point_to_index(ship.x, ship.y)] = true;
+				m_has_ship[pointToIndex(ship.x, ship.y)] = true;
 				break;
 			case ShipAction::MOVE_SOUTH:
 				ship.y = (ship.y == 0) ? Config::size - 1 : ship.y - 1;
 				m_has_ship[index] = false;
-				m_has_ship[point_to_index(ship.x, ship.y)] = true;
+				m_has_ship[pointToIndex(ship.x, ship.y)] = true;
 				break;
 			case ShipAction::MOVE_WEST:
 				ship.x = (ship.x == 0) ? Config::size - 1 : ship.x - 1;
 				m_has_ship[index] = false;
-				m_has_ship[point_to_index(ship.x, ship.y)] = true;
+				m_has_ship[pointToIndex(ship.x, ship.y)] = true;
 				break;
 			}
 			ship.action = ShipAction::NONE;
@@ -140,7 +152,7 @@ struct Board {
 		for (auto& shipyard : m_shipyards) {
 			if (shipyard.action == ShipyardAction::SPAWN) {
 				m_p0_halite -= Config::spawn_cost;
-				m_has_ship[point_to_index(shipyard.x, shipyard.y)] = true;
+				m_has_ship[pointToIndex(shipyard.x, shipyard.y)] = true;
 				m_ships.emplace_back(Ship{ shipyard.x, shipyard.y, ShipAction::NONE });
 			}
 			shipyard.action = ShipyardAction::NONE;
@@ -149,6 +161,8 @@ struct Board {
 		for (int i = 0; i < Config::size * Config::size; ++i) {
 			m_halite[i] *= (1 + Config::regen_rate);
 		}
+
+		m_step++;
 	}
 
 	unsigned						m_step;
@@ -159,4 +173,3 @@ struct Board {
 	std::vector<bool>				m_has_ship;
 	std::vector<bool>				m_has_shipyard;
 };
-
