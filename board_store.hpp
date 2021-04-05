@@ -24,12 +24,12 @@ struct BoardStore {
 		FourthMatF gumbel2 = gumbel2_gen.generate<FourthMatF>(fourth*Config::board_count, fourth, urng);
 		HalfMatI binomial = binomial_gen.generate<HalfMatI>(half*Config::board_count, half, urng);
 
-		const auto quartile_add = gumbel1.max(0) * binomial.cast<float>();
+		const auto quartile_add = gumbel1.max(0) * binomial.template cast<float>();
 		
 		for (int i = 0; i < Config::board_count; ++i) {
 			m_boards[i].populate(
-				quartile_add.middleRows<half>(i*half),
-				(gumbel2.middleRows<fourth>(i*fourth)).max(0));
+				quartile_add.template middleRows<half>(i*half),
+				(gumbel2.template middleRows<fourth>(i*fourth)).max(0));
 		}
 	}
 

@@ -62,7 +62,7 @@ struct Board {
 		}
 
 		quartile += _quartile_add;
-		quartile.bottomRightCorner<fourth, fourth>() += _corner_add;
+		quartile.template bottomRightCorner<fourth, fourth>() += _corner_add;
 		const float quartile_sum = quartile.sum();
 		const float multiplier = Config::starting_halite / quartile_sum / 4.;
 		quartile *= multiplier;
@@ -77,7 +77,7 @@ struct Board {
 			}
 		}
 
-		Ship p0_start_ship;
+		Ship p0_start_ship{0,0,0,ShipAction::NONE};
 		indexToPoint(p0_starting_index, p0_start_ship.x, p0_start_ship.y);
 		m_ships.emplace_back(p0_start_ship);
 	}
@@ -109,9 +109,11 @@ struct Board {
 			const unsigned index = pointToIndex(ship.x, ship.y);
 			switch (ship.action) {
 			case ShipAction::NONE:
+                {
 				const float delta = m_halite[index] * Config::collect_rate;
 				m_halite[index] -= delta;
 				ship.cargo += delta;
+                }
 				break;
 			case ShipAction::CONVERT:
 				m_p0_halite -= Config::convert_cost;
@@ -153,7 +155,7 @@ struct Board {
 			if (shipyard.action == ShipyardAction::SPAWN) {
 				m_p0_halite -= Config::spawn_cost;
 				m_has_ship[pointToIndex(shipyard.x, shipyard.y)] = true;
-				m_ships.emplace_back(Ship{ shipyard.x, shipyard.y, ShipAction::NONE });
+				m_ships.emplace_back(Ship{ shipyard.x, shipyard.y, 0.f, ShipAction::NONE });
 			}
 			shipyard.action = ShipyardAction::NONE;
 		}
