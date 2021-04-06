@@ -76,6 +76,37 @@ def timer(func):
         return value
     return wrapper_timer
 
+
+from torch.nn.modules.utils import _pair
+
+class LocallyConnected2d(nn.Module):
+    def __init__(self, in_channels, out_channels, output_size, kernel_size, stride, bias=True):
+        super(LocallyConnected2d, self).__init__()
+        output_size = _pair(output_size)
+        self.weight = nn.Parameter(
+            torch.randn(1, out_channels, in_channels, output_size[0], output_size[1], kernel_size**2)
+        )
+        if bias:
+            self.bias = nn.Parameter(
+                torch.randn(1, out_channels, output_size[0], output_size[1])
+            )
+        else:
+            self.register_parameter('bias', None)
+        self.kernel_size = _pair(kernel_size)
+        self.stride = _pair(stride)
+
+    def forward(self, x):
+        kh, kw = self.kernel_size
+        dh, dw = self.stride
+        x = x.unfold(2, kh, dh).unfold(3, kw, dw)
+        x = x.contiguous().view(*x.size()[:-2], -1)
+        # Sum in in_channel and kernel_size dims
+        out = (x.unsqueeze(1) * self.weight).sum([2, -1])
+        if self.bias is not None:
+            out += self.bias
+        return out
+    
+    
 class AgentStateManager:        
     def __init__(self, 
             player_id,        
@@ -550,7 +581,7 @@ class NoisyLinear(nn.Module):
         else:
             weight = self.weight_mu
             bias   = self.bias_mu
-        
+
         return F.linear(x, weight, bias)
     
     def reset_parameters(self):
@@ -597,24 +628,18 @@ class DQN(nn.Module):
         self.trained_examples = 0
         
         height = DQN._compute_output_dim(BOARD_SIZE, kernel, stride, pad)
+                
+        locally_connected_layer = LocallyConnected2d(
+            channels, 
+            filters, 
+            height, # output size
+            kernel, 
+            stride)
+        self._conv_layers.append(locally_connected_layer)
         
-#         if channels > 1:
-#             for i in range(channels):
-#                 layer = nn.Conv2d(
-#                    1,    # number of in channels (depth of input)
-#                    1,    # out channels (depth, or number of filters)
-#                    kernel,     # size of convolving kernel
-#                    stride,     # stride of kernel
-#                    pad)        # padding
-#                 nn.init.xavier_uniform_(layer.weight)
-#                 activation = nn.ReLU() if i!=0 else nn.ReLU()
-#                 self._gates.append(nn.Sequential(layer, activation))
-            
-#             height = DQN._compute_output_dim(height, kernel, stride, pad)
-            
         for i in range(conv_layers):
-            channels_in = channels if i==0 else filters * (2**(i-1))
-            channels_out = filters * (2**i)
+            channels_in = filters * (2**(i))
+            channels_out = filters * (2**(i+1))
             layer = nn.Conv2d(
                 channels_in,   # number of in channels (depth of input)
                 channels_out,    # out channels (depth, or number of filters)
@@ -629,12 +654,7 @@ class DQN(nn.Module):
             self._conv_layers.append(layer)
             self._conv_layers.append(bn)
             self._conv_layers.append(activation)
-            # necessary to register layer
-#             setattr(self, "_conv{0}".format(i), layer)
-#             setattr(self, "_conv_bn{0}".format(i), bn)
-#             setattr(self, "_conv_act{0}".format(i), activation)
-            if i!=0:
-                height = DQN._compute_output_dim(height, kernel, stride, pad)
+            height = DQN._compute_output_dim(height, kernel, stride, pad)
         
         self._fc_v_layers = []
         for i in range(fc_layers):
@@ -646,10 +666,6 @@ class DQN(nn.Module):
             act = nn.ReLU()
             self._fc_v_layers.append(layer)
             self._fc_v_layers.append(act)
-            
-            # necessary to register layer
-#             setattr(self, "_fc_v{0}".format(i), layer)
-#             setattr(self, "_fc_v_act{0}".format(i), act)
         
         self._fc_a_layers = []
         for i in range(fc_layers):
@@ -661,10 +677,6 @@ class DQN(nn.Module):
             act = nn.ReLU()
             self._fc_a_layers.append(layer)
             self._fc_a_layers.append(act)
-            
-            # necessary to register layer
-#             setattr(self, "_fc_a{0}".format(i), layer)
-#             setattr(self, "_fc_a_act{0}".format(i), act)
         
         self._fc_a_layers.append(
             NoisyLinear(
@@ -895,32 +907,17 @@ class FeatureCalculator:
         if ship_count>0:
             for i, my_ship in enumerate(cp.ships):
                 shift = (BOARD_SIZE//2 - my_ship.position.x, my_ship.position.y - BOARD_SIZE//2) 
-                
-#                 geometric_ship_ftrs[
-#                     i, 0, 
-#                     BOARD_SIZE - 1 - ship_positions_yx[cls.selector[i, :ship_count], 0], 
-#                     ship_positions_yx[cls.selector[i, :ship_count], 1]] = -2
-                
+                                
                 rolled_halite_tensor = torch.roll(
                     halite_tensor, 
                     shifts=(shift[0], shift[1]), 
                     dims=(1,0))
                 
-                torch.mul(
-                    rolled_halite_tensor, 
-                    cls.middle_heat_flipped, 
-                    out=geometric_ship_ftrs[i, 0])
-                
+                geometric_ship_ftrs[i, 0] = rolled_halite_tensor
 #                 torch.mul(
 #                     rolled_halite_tensor, 
-#                     geometric_ship_ftrs[i, 1], 
-#                     out=geometric_ship_ftrs[i, 1])
-#                 
-#                 torch.mul(
-#                     rolled_halite_tensor, 
-#                     geometric_ship_ftrs[i, 2], 
-#                     out=geometric_ship_ftrs[i, 2])
-                
+#                     cls.middle_heat_flipped, 
+#                     out=geometric_ship_ftrs[i, 0])
                 
 #                 if shipyard_count>0:
 #                     geometric_ship_ftrs[
@@ -928,15 +925,8 @@ class FeatureCalculator:
 #                         BOARD_SIZE - 1 - shipyard_positions_yx[:, 0],
 #                         shipyard_positions_yx[:, 1]] = ((my_ship.halite-min_halite_cell)/diff.item())*(2/remaining)
                         
-#         geometric_ship_ftrs[:,0].mul_(remaining)
-        
-#         ts_ftrs[:, 1] = cp.halite / float(board.configuration.starting_halite)
         if ship_count > 0:
             ts_ftrs[:, 1] = ship_halite / float(board.configuration.starting_halite)
-#         for i, enemy in enumerate(board.opponents):
-#             ts_ftrs[:, 2 + i] = enemy.halite
-#             
-#         ts_ftrs[:, -PLAYERS:] = torch.max(cls.player_zeros, current_ship_cargo - prior_ship_cargo) #@UndefinedVariable
         if ship_count > 0 and shipyard_count > 0:
             distances = distance.cdist(ship_positions_yx, shipyard_positions_yx, metric="cityblock")
         elif ship_count == 0:
