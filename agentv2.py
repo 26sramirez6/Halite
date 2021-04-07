@@ -1286,7 +1286,7 @@ class RewardEngine:
             cls.distance_beta += np.clip(est.coef_[2], -.0005, 0)
             cls.mine_time_beta += np.clip(est.coef_[3], -1., 1.)
             cls.deposit_time_beta += np.clip(est.coef_[4], -1., 1.)
-            cls.distance_time_beta += np.clip(est.coef[5], -1., 1.)
+            cls.distance_time_beta += np.clip(est.coef_[5], -1., 1.)
             
             cls.distance_beta = np.clip(cls.distance_beta, cls.DISTANCE_BETA_MIN, cls.DISTANCE_BETA_MAX)
             
