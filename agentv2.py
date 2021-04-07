@@ -29,10 +29,10 @@ STARTING = 5000
 CONVERT_COST = 500
 BOARD_SIZE = 11
 PLAYERS = 1
-GAMMA = 0.9
-TRAIN_BATCH_SIZE = 48
+GAMMA = 0.99
+TRAIN_BATCH_SIZE = 32
 TARGET_MODEL_UPDATE = 500
-REWARD_GAME_COUNT_LEARNER = 300
+REWARD_GAME_COUNT_LEARNER = 50
 LEARNING_RATE = 0.005
 SHIP_CHANNELS = 2
 SHIPYARD_CHANNELS = 1
@@ -124,7 +124,7 @@ class AgentStateManager:
         self.game_id = 0
         self.prior_board = None
         self.prior_ships_converted = 0
-        self._alpha = 0.6
+        self._alpha = 0.3
         self._beta = 0.4
         self.ship_cur_model = ship_cur_model
         self.shipyard_cur_model = shipyard_cur_model
@@ -465,7 +465,7 @@ class AgentStateManager:
         Q_next_state_targets.add_(rewards.unsqueeze(1))
         
         loss = criterion(Q_current, Q_next_state_targets.detach()).type(torch.float64) * weights.unsqueeze(1)
-        prios = loss + 1e-5
+        prios = loss + 1e-9
         loss = loss.mean()
         optimizer.zero_grad()  
         loss.backward()
@@ -581,7 +581,7 @@ class NoisyLinear(nn.Module):
         else:
             weight = self.weight_mu
             bias   = self.bias_mu
-
+        
         return F.linear(x, weight, bias)
     
     def reset_parameters(self):
@@ -636,7 +636,7 @@ class DQN(nn.Module):
             kernel, 
             stride)
         self._conv_layers.append(locally_connected_layer)
-        
+        self._conv_layers.append(nn.ReLU())
         for i in range(conv_layers):
             channels_in = filters * (2**(i))
             channels_out = filters * (2**(i+1))
@@ -1235,10 +1235,9 @@ class RewardEngine:
 
     DISTANCE_BETA_MIN = 0
     DISTANCE_BETA_MAX = .25    
-    
 
     DEPOSIT_BETA_MIN = .75
-    DEPOSIT_BETA_MAX = 2
+    DEPOSIT_BETA_MAX = 5
     
     MINE_BETA_MIN = 0
     MINE_BETA_MAX = 2
@@ -1265,7 +1264,7 @@ class RewardEngine:
         ret = arr - min_
         ret = ret * (1/diff)
         return ret
-    
+        
     @classmethod
     def update_score(cls, score):
         cls.scores[cls.score_index] = score
@@ -1282,10 +1281,9 @@ class RewardEngine:
             print("reward weight update:", est.coef_, file=LOG)
             print("reward weight update:", est.coef_)
             
-            
-            cls.mine_beta += np.clip(est.coef_[0], -.01, .01)
-            cls.deposit_beta += np.clip(est.coef_[1], -.01, .01)
-            cls.distance_beta += np.clip(est.coef_[2], -.0005, .0005)
+            cls.mine_beta += np.clip(est.coef_[0], -.01, 0)
+            cls.deposit_beta += np.clip(est.coef_[1], 0, .01)
+            cls.distance_beta += np.clip(est.coef_[2], -.0005, 0)
             cls.mine_time_beta += np.clip(est.coef_[3], -1., 1.)
             cls.deposit_time_beta += np.clip(est.coef_[4], -1., 1.)
             cls.distance_time_beta += np.clip(est.coef[5], -1., 1.)
@@ -1358,7 +1356,7 @@ class RewardEngine:
             np.clip(mine_weight*(current_halite_cargo[ship.id] - ship.halite)/max_halite_mineable, 0, 1) + # diff halite cargo
 #             np.clip(current_board.ships[ship.id].cell.halite/(max_halite*4), 0, .25) +
             np.clip(distance_weight*(int(prior_distances[ship.id].min() > current_distances[ship.id].min())*int(ship.halite>0)), 0, 1) + 
-            np.clip(deposit_weight*(ship.halite - current_halite_cargo[ship.id])/max_halite, 0, 2) # diff halite deposited
+            deposit_weight*np.clip((ship.halite - current_halite_cargo[ship.id])/max_halite, 0, 1) # diff halite deposited
 #             int(ship.halite==current_halite_cargo[ship.id] and ship.next_action==None)*-.05 # inactivity
             if ship.id in retained_ships else 0 
             for ship in prior_ships_dict.values()}
@@ -1572,16 +1570,29 @@ agents = [agent]
 
 ship_dqn_cur = DQN(
     SHIP_CHANNELS,  # channels in
-    3,  # number of conv layers
+    2,  # number of conv layers
     1,  # number of fully connected layers at end
-    64, # number of neurons in fully connected layers at end
-    2,  # number of start filters for conv layers (depth)
+    128, # number of neurons in fully connected layers at end
+    64,  # number of start filters for conv layers (depth)
     3,  # size of kernel
     1,  # stride of the kernel
     0,  # padding
     2,  # number of extra time series features
     6,   # out nerouns
     False # is target model?
+).to(DEVICE) 
+ship_dqn_tar = DQN(
+    SHIP_CHANNELS, # channels in
+    2,  # number of conv layers
+    1,  # number of fully connected layers at end
+    128, # number of neurons in fully connected layers at end
+    64,  # number of start filters for conv layers (depth)
+    3,  # size of kernel
+    1,  # stride of the kernel
+    0,  # padding
+    2,  # number of extra time series features
+    6,   # out nerouns
+    True # is target model?
 ).to(DEVICE)  
 shipyard_dqn_cur = DQN(
     SHIPYARD_CHANNELS,  # channels in
@@ -1595,20 +1606,6 @@ shipyard_dqn_cur = DQN(
     2,  # number of extra time series features
     2,   # out nerouns
     False # is target model?
-).to(DEVICE) 
- 
-ship_dqn_tar = DQN(
-    SHIP_CHANNELS, # channels in
-    3,  # number of conv layers
-    1,  # number of fully connected layers at end
-    64, # number of neurons in fully connected layers at end
-    2,  # number of start filters for conv layers (depth)
-    3,  # size of kernel
-    1,  # stride of the kernel
-    0,  # padding
-    2,  # number of extra time series features
-    6,   # out nerouns
-    True # is target model?
 ).to(DEVICE)  
 shipyard_dqn_tar = DQN(
     SHIPYARD_CHANNELS, #channels in
