@@ -32,7 +32,7 @@ PLAYERS = 1
 GAMMA = 0.99
 TRAIN_BATCH_SIZE = 32
 TARGET_MODEL_UPDATE = 500
-REWARD_GAME_COUNT_LEARNER = 50
+REWARD_GAME_COUNT_LEARNER = 300
 LEARNING_RATE = 0.005
 SHIP_CHANNELS = 2
 SHIPYARD_CHANNELS = 1
@@ -124,8 +124,8 @@ class AgentStateManager:
         self.game_id = 0
         self.prior_board = None
         self.prior_ships_converted = 0
-        self._alpha = 0.3
-        self._beta = 0.4
+        self._alpha = 0.2
+        self._beta = 0.3
         self.ship_cur_model = ship_cur_model
         self.shipyard_cur_model = shipyard_cur_model
         self.ship_tar_model = ship_tar_model
@@ -281,12 +281,13 @@ class AgentStateManager:
             
             ship_idxs = np.random.choice(
                 list(range(ship_end)), 
-                size=batch_size,
-                p=probs)
+                size=batch_size)
+#                 p=probs)
             
             weights = (ship_end * probs[ship_idxs])**(-min(1.0, self._beta + self._total_ship_samples * (1.0 - self._beta) / 50000))
             weights.div_(weights.max())
-            
+            print("loss weights: ", weights, file=LOG)
+            weights[:] = 1
             return (self._geo_ship_ftrs_t0[ship_idxs], 
                     self._ts_ship_ftrs_t0[ship_idxs],
                     self._geo_ship_ftrs_t1[ship_idxs], 
@@ -304,12 +305,12 @@ class AgentStateManager:
             
             shipyard_idxs = np.random.choice(
                 list(range(shipyard_end)), 
-                size=batch_size,
-                p=probs)
+                size=batch_size)
+                #p=probs)
             
             weights = (shipyard_end * probs[shipyard_idxs])**(-min(1.0, self._beta + self._total_shipyard_samples * (1.0 - self._beta) / 50000))
             weights.div_(weights.max())
-            
+            weights[:] = 1 
             return (self._geo_shipyard_ftrs_t0[shipyard_idxs], 
                     self._ts_shipyard_ftrs_t0[shipyard_idxs],
                     self._geo_shipyard_ftrs_t1[shipyard_idxs], 
@@ -464,7 +465,7 @@ class AgentStateManager:
         
         Q_next_state_targets.add_(rewards.unsqueeze(1))
         
-        loss = criterion(Q_current, Q_next_state_targets.detach()).type(torch.float64) * weights.unsqueeze(1)
+        loss = criterion(Q_current, Q_next_state_targets.detach()).type(torch.float64) * weights.unsqueeze(1).detach()
         prios = loss + 1e-9
         loss = loss.mean()
         optimizer.zero_grad()  
@@ -557,7 +558,7 @@ class AgentStateManager:
             self._total_shipyard_reward_idx %= MAX_EPISODES_MEMORY
             
 class NoisyLinear(nn.Module):
-    def __init__(self, in_features, out_features, std_init=.00001):
+    def __init__(self, in_features, out_features, std_init=.01):
         super(NoisyLinear, self).__init__()
         
         self.in_features  = in_features
@@ -627,8 +628,8 @@ class DQN(nn.Module):
         self._channels = channels
         self.trained_examples = 0
         
-        height = DQN._compute_output_dim(BOARD_SIZE, kernel, stride, pad)
-                
+        height = DQN._compute_output_dim(BOARD_SIZE, kernel, stride, pad) 
+
         locally_connected_layer = LocallyConnected2d(
             channels, 
             filters, 
@@ -636,7 +637,8 @@ class DQN(nn.Module):
             kernel, 
             stride)
         self._conv_layers.append(locally_connected_layer)
-        self._conv_layers.append(nn.ReLU())
+        self._conv_layers.append(nn.Sigmoid())
+        channels_out = filters
         for i in range(conv_layers):
             channels_in = filters * (2**(i))
             channels_out = filters * (2**(i+1))
@@ -646,6 +648,13 @@ class DQN(nn.Module):
                 kernel,     # size of convolving kernel
                 stride,     # stride of kernel
                 pad)        # padding
+#             layer = LocallyConnected2d(
+#                 channels_in, 
+#                 channels_out, 
+#                 height, # output size
+#                 kernel, 
+#                 stride)
+            
             nn.init.xavier_uniform_(layer.weight)
             bn = nn.BatchNorm2d(channels_out)
             activation = nn.ReLU() if i!=0 else nn.ReLU()
@@ -654,6 +663,7 @@ class DQN(nn.Module):
             self._conv_layers.append(layer)
             self._conv_layers.append(bn)
             self._conv_layers.append(activation)
+            
             height = DQN._compute_output_dim(height, kernel, stride, pad)
         
         self._fc_v_layers = []
@@ -663,7 +673,8 @@ class DQN(nn.Module):
                 fc_volume, # number of neurons in output layer,
                 is_target_model)
 #             nn.init.xavier_uniform_(layer.weight)
-            act = nn.ReLU()
+            #act = nn.ReLU()
+            act = nn.Sigmoid()
             self._fc_v_layers.append(layer)
             self._fc_v_layers.append(act)
         
@@ -675,6 +686,7 @@ class DQN(nn.Module):
                 is_target_model)
 #             nn.init.xavier_uniform_(layer.weight)
             act = nn.ReLU()
+            act = nn.Sigmoid()
             self._fc_a_layers.append(layer)
             self._fc_a_layers.append(act)
         
@@ -914,6 +926,7 @@ class FeatureCalculator:
                     dims=(1,0))
                 
                 geometric_ship_ftrs[i, 0] = rolled_halite_tensor
+                
 #                 torch.mul(
 #                     rolled_halite_tensor, 
 #                     cls.middle_heat_flipped, 
@@ -1267,6 +1280,7 @@ class RewardEngine:
         
     @classmethod
     def update_score(cls, score):
+        return 
         cls.scores[cls.score_index] = score
         cls.weights[cls.score_index, 0] = cls.mine_beta
         cls.weights[cls.score_index, 1] = cls.deposit_beta
@@ -1429,7 +1443,6 @@ def agent(obs, config):
     asm = agent_managers.get(current_board.current_player.id)
     step = current_board.step        
     asm.set_prior_ship_cargo(asm.current_ship_cargo)
-    
     ship_reward, shipyard_reward = asm.action_selector.select_action(current_board)
     if PRINT_STATEMENTS:
         print("board step:", 
@@ -1570,10 +1583,10 @@ agents = [agent]
 
 ship_dqn_cur = DQN(
     SHIP_CHANNELS,  # channels in
-    2,  # number of conv layers
+    0,  # number of conv layers
     1,  # number of fully connected layers at end
-    128, # number of neurons in fully connected layers at end
-    64,  # number of start filters for conv layers (depth)
+    64, # number of neurons in fully connected layers at end
+    32,  # number of start filters for conv layers (depth)
     3,  # size of kernel
     1,  # stride of the kernel
     0,  # padding
@@ -1583,10 +1596,10 @@ ship_dqn_cur = DQN(
 ).to(DEVICE) 
 ship_dqn_tar = DQN(
     SHIP_CHANNELS, # channels in
-    2,  # number of conv layers
+    0,  # number of conv layers
     1,  # number of fully connected layers at end
-    128, # number of neurons in fully connected layers at end
-    64,  # number of start filters for conv layers (depth)
+    64, # number of neurons in fully connected layers at end
+    32,  # number of start filters for conv layers (depth)
     3,  # size of kernel
     1,  # stride of the kernel
     0,  # padding
