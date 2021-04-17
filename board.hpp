@@ -6,7 +6,8 @@
 #include <ctime>
 #include <cmath>
 #include <cstdio>
-
+#include <sstream>
+#include <iostream>
 #include "ship.hpp"
 #include "board_config.hpp"
 
@@ -71,15 +72,16 @@ struct Board {
 		for (int c = 0; c < half; ++c) {
 			for (int r = 0; r < half; ++r) {
 				m_halite[Config::size*r + c] = quartile(r, c);
-				m_halite[Config::size*r + (Config::size - c + 1)] = quartile(r, c);
-				m_halite[Config::size * (Config::size - 1) - (Config::size * r) + c] = quartile(r, c);
-				m_halite[Config::size * (Config::size - 1) - (Config::size * r) + (Config::size - c - 1)] = quartile(r, c);
+				m_halite[Config::size*r + (Config::size - c - 1)] = quartile(r, c);
+				m_halite[Config::size*(Config::size - 1) - (Config::size * r) + c] = quartile(r, c);
+				m_halite[Config::size*(Config::size - 1) - (Config::size * r) + (Config::size - c - 1)] = quartile(r, c);
 			}
 		}
 
 		Ship p0_start_ship{0,0,0,ShipAction::NONE};
 		indexToPoint(p0_starting_index, p0_start_ship.x, p0_start_ship.y);
 		m_ships.emplace_back(p0_start_ship);
+		m_has_ship[p0_starting_index] = true;
 	}
 
 	static inline unsigned pointToIndex(uint8_t x, uint8_t y) {
@@ -144,8 +146,7 @@ struct Board {
 			}
 			ship.action = ShipAction::NONE;
 			
-
-			if (ship.x == m_shipyards[0].x && ship.y == m_shipyards[0].y) {
+			if (m_shipyards.size() > 0 && ship.x == m_shipyards[0].x && ship.y == m_shipyards[0].y) {
 				m_p0_halite += ship.cargo;
 				ship.cargo = 0;
 			}
@@ -165,6 +166,43 @@ struct Board {
 		}
 
 		m_step++;
+	}
+
+	void printBoard() {
+	    std::stringstream ss;
+	    for (int y = 0; y < Config::size; ++y) {
+	        for (int x = 0; x < Config::size; ++x) {
+	            const unsigned index = pointToIndex(x,y);
+	            ss << "|";
+	            if (m_has_ship[index]) {
+	                ss << "a";
+	            } else {
+	                ss << " ";
+	            }
+
+	            const int normalized_halite = static_cast<int>(9 * m_halite[index] / Config::max_cell_halite);
+	            ss << normalized_halite;
+	            if (m_has_shipyard[index]) {
+	                ss << "A";
+	            } else {
+	                ss << " ";
+	            }
+	        }
+	        ss << "|\n";
+	    }
+	    std::cout << ss.str() << std::endl;
+	}
+
+	void setActions(const std::vector<unsigned>& _ship_actions,
+	        const std::vector<unsigned>& _shipyard_actions) {
+	    assert(_ship_actions.size() == m_ships.size());
+	    assert(_shipyard_actions.size() == m_shipyards.size());
+	    for (int i = 0; i < _ship_actions.size(); ++i) {
+	        m_ships[i].action = static_cast<ShipAction>(_ship_actions[i]);
+	    }
+	    for (int i = 0; i < _shipyard_actions.size(); ++i) {
+            m_shipyards[i].action = static_cast<ShipyardAction>(_shipyard_actions[i]);
+        }
 	}
 
 	unsigned						m_step;

@@ -44,16 +44,18 @@ SHIP_MOVE_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,Shi
 TS_FTR_COUNT = 2 #1 + PLAYERS*2 
 GAME_COUNT = 10000
 TIMESTAMP = str(datetime.datetime.now()).replace(' ', '_').replace(':', '.').replace('-',"_")
-OUTPUT_HTML = False
+OUTPUT_HTML = True
 OUTPUT_REWARDS = False
 OUTPUT_HALITE = True
 PRINT_STATEMENTS = True
 TRAIN_MODELS = True
-USE_EPSILON = False
+USE_EPSILON = True
 RANDOM_SEED = -1; 
+CONFIG_RANDOM_SEED = -1; 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu") #@UndefinedVariable
 SHIP_HALITE_ALLOCATION = .89
 SHIPYARD_HALITE_ALLOCATION = 1-SHIP_HALITE_ALLOCATION
+LSTM_LAYERS = 5
 
 if RANDOM_SEED > -1: 
     np.random.seed(RANDOM_SEED)
@@ -62,6 +64,10 @@ if RANDOM_SEED > -1:
 if not os.path.exists(TIMESTAMP):
     os.makedirs(TIMESTAMP)
     LOG = open("{0}/log_{0}".format(TIMESTAMP), "w")
+    with open(os.path.basename(__file__), "r") as f1:
+        this_script = f1.read()
+        with open("{0}/{1}".format(TIMESTAMP, os.path.basename(__file__)), "w") as f2:
+            f2.write(this_script)
 else:
     LOG = open("{0}/log_{0}".format(TIMESTAMP), "a")
     
@@ -86,10 +92,12 @@ class LocallyConnected2d(nn.Module):
         self.weight = nn.Parameter(
             torch.randn(1, out_channels, in_channels, output_size[0], output_size[1], kernel_size**2)
         )
+#         nn.init.xavier_uniform_(self.weight)
         if bias:
             self.bias = nn.Parameter(
                 torch.randn(1, out_channels, output_size[0], output_size[1])
             )
+#             nn.init.xavier_uniform_(self.weight)
         else:
             self.register_parameter('bias', None)
         self.kernel_size = _pair(kernel_size)
@@ -106,6 +114,193 @@ class LocallyConnected2d(nn.Module):
             out += self.bias
         return out
     
+    def get_out_volume(self):
+        return (self.weight.shape[1]*
+                self.weight.shape[3]*
+                self.weight.shape[4])
+
+class ConvLSTMCell(nn.Module):
+
+    def __init__(self, input_dim, hidden_dim, kernel_size, bias):
+        """
+        Initialize ConvLSTM cell.
+        Parameters
+        ----------
+        input_dim: int
+            Number of channels of input tensor.
+        hidden_dim: int
+            Number of channels of hidden state.
+        kernel_size: (int, int)
+            Size of the convolutional kernel.
+        bias: bool
+            Whether or not to add the bias.
+        """
+
+        super(ConvLSTMCell, self).__init__()
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+
+        self.kernel_size = kernel_size
+        self.padding = kernel_size[0] // 2, kernel_size[1] // 2
+        self.bias = bias
+
+        self.conv = nn.Conv2d(in_channels=self.input_dim + self.hidden_dim,
+                              out_channels=4 * self.hidden_dim,
+                              kernel_size=self.kernel_size,
+                              padding=self.padding,
+                              bias=self.bias)
+
+    def forward(self, input_tensor, cur_state):
+        h_cur, c_cur = cur_state
+
+        combined = torch.cat([input_tensor, h_cur], dim=1)  # concatenate along channel axis
+
+        combined_conv = self.conv(combined)
+        cc_i, cc_f, cc_o, cc_g = torch.split(combined_conv, self.hidden_dim, dim=1)
+        i = torch.sigmoid(cc_i)
+        f = torch.sigmoid(cc_f)
+        o = torch.sigmoid(cc_o)
+        g = torch.tanh(cc_g)
+
+        c_next = f * c_cur + i * g
+        h_next = o * torch.tanh(c_next)
+
+        return h_next, c_next
+
+    def init_hidden(self, batch_size, image_size):
+        height, width = image_size
+        return (torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device),
+                torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device))
+
+
+class ConvLSTM(nn.Module):
+
+    """
+    Parameters:
+        input_dim: Number of channels in input
+        hidden_dim: Number of hidden channels
+        kernel_size: Size of kernel in convolutions
+        num_layers: Number of LSTM layers stacked on each other
+        batch_first: Whether or not dimension 0 is the batch or not
+        bias: Bias or no bias in Convolution
+        return_all_layers: Return the list of computations for all layers
+        Note: Will do same padding.
+    Input:
+        A tensor of size B, T, C, H, W or T, B, C, H, W
+    Output:
+        A tuple of two lists of length num_layers (or length 1 if return_all_layers is False).
+            0 - layer_output_list is the list of lists of length T of each output
+            1 - last_state_list is the list of last states
+                    each element of the list is a tuple (h, c) for hidden state and memory
+    Example:
+        >> x = torch.rand((32, 10, 64, 128, 128))
+        >> convlstm = ConvLSTM(64, 16, 3, 1, True, True, False)
+        >> _, last_states = convlstm(x)
+        >> h = last_states[0][0]  # 0 for layer index, 0 for h index
+    """
+
+    def __init__(self, input_dim, hidden_dim, kernel_size, num_layers,
+                 batch_first=False, bias=True, return_all_layers=False):
+        super(ConvLSTM, self).__init__()
+
+        self._check_kernel_size_consistency(kernel_size)
+
+        # Make sure that both `kernel_size` and `hidden_dim` are lists having len == num_layers
+        kernel_size = self._extend_for_multilayer(kernel_size, num_layers)
+        hidden_dim = self._extend_for_multilayer(hidden_dim, num_layers)
+        if not len(kernel_size) == len(hidden_dim) == num_layers:
+            raise ValueError('Inconsistent list length.')
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.kernel_size = kernel_size
+        self.num_layers = num_layers
+        self.batch_first = batch_first
+        self.bias = bias
+        self.return_all_layers = return_all_layers
+
+        cell_list = []
+        for i in range(0, self.num_layers):
+            cur_input_dim = self.input_dim if i == 0 else self.hidden_dim[i - 1]
+
+            cell_list.append(ConvLSTMCell(input_dim=cur_input_dim,
+                                          hidden_dim=self.hidden_dim[i],
+                                          kernel_size=self.kernel_size[i],
+                                          bias=self.bias))
+
+        self.cell_list = nn.ModuleList(cell_list)
+
+    def forward(self, input_tensor, hidden_state=None):
+        """
+        Parameters
+        ----------
+        input_tensor: todo
+            5-D Tensor either of shape (t, b, c, h, w) or (b, t, c, h, w)
+        hidden_state: todo
+            None. todo implement stateful
+        Returns
+        -------
+        last_state_list, layer_output
+        """
+        if not self.batch_first:
+            # (t, b, c, h, w) -> (b, t, c, h, w)
+            input_tensor = input_tensor.permute(1, 0, 2, 3, 4)
+
+        b, _, _, h, w = input_tensor.size()
+
+        # Implement stateful ConvLSTM
+        if hidden_state is not None:
+            raise NotImplementedError()
+        else:
+            # Since the init is done in forward. Can send image size here
+            hidden_state = self._init_hidden(batch_size=b,
+                                             image_size=(h, w))
+
+        layer_output_list = []
+        last_state_list = []
+
+        seq_len = input_tensor.size(1)
+        cur_layer_input = input_tensor
+
+        for layer_idx in range(self.num_layers):
+
+            h, c = hidden_state[layer_idx]
+            output_inner = []
+            for t in range(seq_len):
+                h, c = self.cell_list[layer_idx](input_tensor=cur_layer_input[:, t, :, :, :],
+                                                 cur_state=[h, c])
+                output_inner.append(h)
+
+            layer_output = torch.stack(output_inner, dim=1)
+            cur_layer_input = layer_output
+
+            layer_output_list.append(layer_output)
+            last_state_list.append([h, c])
+
+        if not self.return_all_layers:
+            layer_output_list = layer_output_list[-1:]
+            last_state_list = last_state_list[-1:]
+
+        return layer_output_list, last_state_list
+
+    def _init_hidden(self, batch_size, image_size):
+        init_states = []
+        for i in range(self.num_layers):
+            init_states.append(self.cell_list[i].init_hidden(batch_size, image_size))
+        return init_states
+
+    @staticmethod
+    def _check_kernel_size_consistency(kernel_size):
+        if not (isinstance(kernel_size, tuple) or
+                (isinstance(kernel_size, list) and all([isinstance(elem, tuple) for elem in kernel_size]))):
+            raise ValueError('`kernel_size` must be tuple or list of tuples')
+
+    @staticmethod
+    def _extend_for_multilayer(param, num_layers):
+        if not isinstance(param, list):
+            param = [param] * num_layers
+        return param
     
 class AgentStateManager:        
     def __init__(self, 
@@ -524,7 +719,10 @@ class AgentStateManager:
             self._ship_rewards[start_ship:end_ship] = rewards[:count]
             self._ship_non_terminals[start_ship:end_ship] = non_terminals[:count]
             if conversion_indices.sum() > 0:
-                self._geo_ftrs_ship_converted_t1[start_ship:end_ship][conversion_indices[:count].tolist()] = geo_ftrs_ship_conversions_t1[:conversion_indices[:count].sum()]
+                try:
+                    self._geo_ftrs_ship_converted_t1[start_ship:end_ship][conversion_indices[:count].tolist()] = geo_ftrs_ship_conversions_t1[:conversion_indices[:count].sum()]
+                except Exception as e:
+                    raise e
             self._ship_prios[start_ship:end_ship] = 1 if self._current_ship_sample_pos==0 and not self._ship_buffer_filled else self._ship_prios.max()
             self._current_ship_sample_pos += count
             self._total_ship_samples += count
@@ -628,51 +826,56 @@ class DQN(nn.Module):
         self._channels = channels
         self.trained_examples = 0
         
-        height = DQN._compute_output_dim(BOARD_SIZE, kernel, stride, pad) 
-
+        height = DQN._compute_output_dim(BOARD_SIZE, kernel, stride, 0) 
+          
         locally_connected_layer = LocallyConnected2d(
-            channels, 
-            filters, 
-            height, # output size
-            kernel, 
+            channels,
+            filters,
+            height,
+            kernel,
             stride)
         self._conv_layers.append(locally_connected_layer)
         self._conv_layers.append(nn.Sigmoid())
+#         self._conv_layers.append(nn.BatchNorm2d(filters))
         channels_out = filters
+        
         for i in range(conv_layers):
             channels_in = filters * (2**(i))
             channels_out = filters * (2**(i+1))
-            layer = nn.Conv2d(
-                channels_in,   # number of in channels (depth of input)
-                channels_out,    # out channels (depth, or number of filters)
-                kernel,     # size of convolving kernel
-                stride,     # stride of kernel
-                pad)        # padding
-#             layer = LocallyConnected2d(
-#                 channels_in, 
-#                 channels_out, 
-#                 height, # output size
-#                 kernel, 
-#                 stride)
-            
-            nn.init.xavier_uniform_(layer.weight)
+            height = DQN._compute_output_dim(height, kernel, stride, pad)
+            #layer = nn.Conv2d(
+            #     channels_in,   # number of in channels (depth of input)
+            #     channels_out,    # out channels (depth, or number of filters)
+            #     kernel,     # size of convolving kernel
+            #     stride,     # stride of kernel
+            #     pad)        # padding
+            layer = LocallyConnected2d(
+                    channels_in,
+                    channels_out,
+                    height,
+                    kernel,
+                    stride)
+            #nn.init.xavier_uniform_(layer.weight)
             bn = nn.BatchNorm2d(channels_out)
-            activation = nn.ReLU() if i!=0 else nn.ReLU()
-            
-            
+            activation = nn.ReLU()
+             
+             
             self._conv_layers.append(layer)
             self._conv_layers.append(bn)
             self._conv_layers.append(activation)
-            
-            height = DQN._compute_output_dim(height, kernel, stride, pad)
+             
+#             height = DQN._compute_output_dim(height, kernel, stride, pad)
         
         self._fc_v_layers = []
         for i in range(fc_layers):
-            layer = NoisyLinear(
-                (height * height * channels_out + ts_ftrs) if i==0 else fc_volume, # number of neurons from previous layer
-                fc_volume, # number of neurons in output layer,
-                is_target_model)
-#             nn.init.xavier_uniform_(layer.weight)
+#             layer = NoisyLinear(
+#                 (height * height * channels_out + ts_ftrs) if i==0 else fc_volume, # number of neurons from previous layer
+#                 fc_volume, # number of neurons in output layer,
+#                 is_target_model)
+            layer = nn.Linear(
+                (height * height * channels_out + ts_ftrs) if i==0 else fc_volume,
+                fc_volume)
+            nn.init.xavier_uniform_(layer.weight)
             #act = nn.ReLU()
             act = nn.Sigmoid()
             self._fc_v_layers.append(layer)
@@ -680,28 +883,42 @@ class DQN(nn.Module):
         
         self._fc_a_layers = []
         for i in range(fc_layers):
-            layer = NoisyLinear(
-                (height * height * channels_out + ts_ftrs) if i==0 else fc_volume, # number of neurons from previous layer
-                fc_volume, # number of neurons in output layer,
-                is_target_model)
-#             nn.init.xavier_uniform_(layer.weight)
-            act = nn.ReLU()
+#             layer = NoisyLinear(
+#                 (height * height * channels_out + ts_ftrs) if i==0 else fc_volume, # number of neurons from previous layer
+#                 fc_volume, # number of neurons in output layer,
+#                 is_target_model)
+            layer = nn.Linear(
+                (height * height * channels_out + ts_ftrs) if i==0 else fc_volume,
+                fc_volume)
+            nn.init.xavier_uniform_(layer.weight)            
+#             act = nn.ReLU()
             act = nn.Sigmoid()
             self._fc_a_layers.append(layer)
             self._fc_a_layers.append(act)
         
+#         self._fc_a_layers.append(
+#             NoisyLinear(
+#                 fc_volume, # number of neurons from previous layer
+#                 out_neurons, # number of neurons in output layer,
+#                 is_target_model))
+        
         self._fc_a_layers.append(
-            NoisyLinear(
+            nn.Linear(
                 fc_volume, # number of neurons from previous layer
-                out_neurons, # number of neurons in output layer,
-                is_target_model))
+                out_neurons))
 #         nn.init.xavier_uniform_(self._fc_a_layers[-1].weight)
         
+#         self._fc_v_layers.append(
+#             NoisyLinear(
+#                 fc_volume, # number of neurons from previous layer
+#                 1, # number of neurons in output layer,
+#                 is_target_model))
+        
         self._fc_v_layers.append(
-            NoisyLinear(
-                fc_volume, # number of neurons from previous layer
-                1, # number of neurons in output layer,
-                is_target_model))
+            nn.Linear(
+                fc_volume,
+                1))
+        
 #         nn.init.xavier_uniform_(self._fc_v_layers[-1].weight)
         
         self.cnn = nn.Sequential(*self._conv_layers)
@@ -723,6 +940,10 @@ class DQN(nn.Module):
 #             y = torch.mul(*gates)
 #             y = self.cnn(y)
 #         else:
+#         gates = [gate(geometric_x).view(-1, self._volumes[i]) 
+#                  for i, gate in enumerate(self._gates)]
+#         y = torch.cat(gates, dim=1)
+#         y = torch.cat((y, ts_x[:,0:2]), dim=1)
         y = self.cnn(geometric_x)
         y = y.view(-1, y.shape[1] * y.shape[2] * y.shape[3])
         y = torch.cat((y, ts_x[:,0:2]), dim=1) #@UndefinedVariable
@@ -1001,6 +1222,9 @@ class ActionSelector:
         
         self._non_terminal_shipyards = torch.zeros(#@UndefinedVariable
             MAX_SHIPS, dtype=torch.uint8).to(DEVICE)#@UndefinedVariable
+        
+        self._ship_indexer = np.arange(MAX_SHIPS)
+        
         self.episode_index = 0
         self.epsilon_start = 1
         self.epsilon_end = 0.01
@@ -1068,8 +1292,15 @@ class ActionSelector:
                 math.exp(-1 * self.episode_index / self.epsilon_decay))):
                 self._best_ship_actions[:ship_count] = np.random.choice(range(6), ship_count)
                 self._best_shipyard_actions[:shipyard_count] = np.random.choice(range(2), shipyard_count)
-                self._best_ship_actions[self._best_ship_actions==5][max_new_shipyards_allowed:] = 0
-                self._best_shipyard_actions[self._best_shipyard_actions==1][max_new_ships_allowed:] = 0
+                
+                remove_convert_mask = self._best_ship_actions==5
+                remove_convert_mask = np.logical_and(remove_convert_mask, remove_convert_mask.cumsum() > max_new_shipyards_allowed)
+                self._best_ship_actions[remove_convert_mask] = np.random.choice(range(5), remove_convert_mask.sum())
+                
+                remove_spawn_mask = self._best_shipyard_actions==1
+                remove_spawn_mask = np.logical_and(remove_spawn_mask, remove_spawn_mask.cumsum() > max_new_ships_allowed)
+                self._best_shipyard_actions[remove_spawn_mask] = 0
+                
                 self._force_remove_spawn(
                     self._best_shipyard_actions, 
                     ship_count, 
@@ -1259,9 +1490,9 @@ class RewardEngine:
     def init_weights(cls):
         cls.reward_step = 1 / EPISODE_STEPS
         
-        cls.mine_beta = 1.
-        cls.deposit_beta = 1.
-        cls.distance_beta = .025
+        cls.mine_beta = 2.
+        cls.deposit_beta = 3.
+        cls.distance_beta = .05
         cls.mine_time_beta = EPISODE_STEPS / 2. # smaller negative makes curve less linear
         cls.deposit_time_beta = EPISODE_STEPS / 2.
         cls.distance_time_beta = EPISODE_STEPS / 2.
@@ -1367,10 +1598,10 @@ class RewardEngine:
         max_halite = float(max(prior_board.observation['halite']))
                 
         rewards = {ship.id: 
-            np.clip(mine_weight*(current_halite_cargo[ship.id] - ship.halite)/max_halite_mineable, 0, 1) + # diff halite cargo
+            np.clip(mine_weight*(current_halite_cargo[ship.id] - ship.halite)/max_halite_mineable, 0, 2) + # diff halite cargo
 #             np.clip(current_board.ships[ship.id].cell.halite/(max_halite*4), 0, .25) +
             np.clip(distance_weight*(int(prior_distances[ship.id].min() > current_distances[ship.id].min())*int(ship.halite>0)), 0, 1) + 
-            deposit_weight*np.clip((ship.halite - current_halite_cargo[ship.id])/max_halite, 0, 1) # diff halite deposited
+            deposit_weight*np.clip((ship.halite - current_halite_cargo[ship.id])/max_halite, 0, 3) # diff halite deposited
 #             int(ship.halite==current_halite_cargo[ship.id] and ship.next_action==None)*-.05 # inactivity
             if ship.id in retained_ships else 0 
             for ship in prior_ships_dict.values()}
@@ -1393,6 +1624,7 @@ class RewardEngine:
              shipyard_rewards, 
              non_terminal_shipyards,
              max_halite_cell):
+        return
         current_player = current_board.current_player
         prior_player = prior_board.current_player
         
@@ -1443,7 +1675,9 @@ def agent(obs, config):
     asm = agent_managers.get(current_board.current_player.id)
     step = current_board.step        
     asm.set_prior_ship_cargo(asm.current_ship_cargo)
+    
     ship_reward, shipyard_reward = asm.action_selector.select_action(current_board)
+    
     if PRINT_STATEMENTS:
         print("board step:", 
           step, 
@@ -1575,8 +1809,8 @@ config = {
     "actTimeout": 1e8, 
     "runTimeout":1e8}
 
-if RANDOM_SEED > -1: 
-    config["randomSeed"] = RANDOM_SEED
+if CONFIG_RANDOM_SEED > -1: 
+    config["randomSeed"] = CONFIG_RANDOM_SEED
 
 i = 1
 agents = [agent]
@@ -1584,9 +1818,9 @@ agents = [agent]
 ship_dqn_cur = DQN(
     SHIP_CHANNELS,  # channels in
     0,  # number of conv layers
-    1,  # number of fully connected layers at end
-    64, # number of neurons in fully connected layers at end
-    32,  # number of start filters for conv layers (depth)
+    3,  # number of fully connected layers at end
+    32, # number of neurons in fully connected layers at end
+    16,  # number of start filters for conv layers (depth)
     3,  # size of kernel
     1,  # stride of the kernel
     0,  # padding
@@ -1597,9 +1831,9 @@ ship_dqn_cur = DQN(
 ship_dqn_tar = DQN(
     SHIP_CHANNELS, # channels in
     0,  # number of conv layers
-    1,  # number of fully connected layers at end
-    64, # number of neurons in fully connected layers at end
-    32,  # number of start filters for conv layers (depth)
+    3,  # number of fully connected layers at end
+    32, # number of neurons in fully connected layers at end
+    16,  # number of start filters for conv layers (depth)
     3,  # size of kernel
     1,  # stride of the kernel
     0,  # padding
@@ -1609,7 +1843,7 @@ ship_dqn_tar = DQN(
 ).to(DEVICE)  
 shipyard_dqn_cur = DQN(
     SHIPYARD_CHANNELS,  # channels in
-    3,  # number of conv layers
+    0,  # number of conv layers
     1,  # number of fully connected layers at end
     64, # number of neurons in fully connected layers at end
     2,  # number of start filters for conv layers (depth)
@@ -1622,7 +1856,7 @@ shipyard_dqn_cur = DQN(
 ).to(DEVICE)  
 shipyard_dqn_tar = DQN(
     SHIPYARD_CHANNELS, #channels in
-    3,  # number of conv layers
+    0,  # number of conv layers
     1,  # number of fully connected layers at end
     64, # number of neurons in fully connected layers at end
     2,  # number of start filters for conv layers (depth)
