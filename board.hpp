@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <cmath>
+#include <map>
 #include <cstdio>
 #include <sstream>
 #include <iostream>
@@ -28,10 +29,10 @@ struct Board {
 	using QuartileMatI = Eigen::Array<int, half, half>;
 	Board() : 
 		m_step(0), 
+		m_global_ship_id(0),
+        m_global_shipyard_id(0),
 		m_p0_halite(Config::starting_halite),
 		m_halite(Config::size*Config::size, 0), 
-		m_ships(),
-		m_shipyards(),
 		m_has_ship(Config::size, 0),
 		m_has_shipyard(Config::size, 0) {}
 
@@ -78,10 +79,11 @@ struct Board {
 			}
 		}
 
-		Ship p0_start_ship{0,0,0,ShipAction::NONE};
+		Ship p0_start_ship{0,0,0,0.f,ShipAction::NONE};
 		indexToPoint(p0_starting_index, p0_start_ship.x, p0_start_ship.y);
-		m_ships.emplace_back(p0_start_ship);
 		m_has_ship[p0_starting_index] = true;
+		m_ship_map.emplace(p0_start_ship.id, p0_start_ship);
+		++m_global_ship_id;
 	}
 
 	static inline unsigned pointToIndex(uint8_t x, uint8_t y) {
@@ -94,34 +96,38 @@ struct Board {
 		y_ = Config::size - dv.quot - 1;
 	}
 
-	inline double getPlayerHalite() { return m_p0_halite; }
+	inline float getPlayerHalite() { return m_p0_halite; }
 	inline std::vector<float>& getHaliteGrid() { return m_halite; }
-	inline std::vector<Ship>& getShips() { return m_ships; }
-	inline std::vector<Shipyard>& getShipyards() { return m_shipyards; }
 	inline bool pointHasShip(uint8_t x, uint8_t y) { return m_has_ship[pointToIndex(x, y)]; }
 	inline bool pointHasShipyard(uint8_t x, uint8_t y) { return m_has_shipyard[pointToIndex(x, y)]; }
 	inline bool indexHasShip(unsigned index) { return m_has_ship[index]; }
 	inline bool indexHasShipyard(unsigned index) { return m_has_shipyard[index]; }
-	inline unsigned getShipCount() { return m_ships.size(); }
-	inline unsigned getShipyardCount() { return m_shipyards.size(); }
+	inline unsigned getShipCount() { return m_ship_map.size(); }
+	inline unsigned getShipyardCount() { return m_shipyard_map.size(); }
 	inline unsigned getStep() { return m_step; }
+	inline Ship& getShip(int key) { return m_ship_map.at(key); }
 
 	inline void step() {
-		for (auto& ship : m_ships) {
+	    std::vector<int> remove_ships;
+	    std::vector<Shipyard> add_shipyards;
+		for (auto& kv : m_ship_map) {
+		    auto& ship = kv.second;
 			const unsigned index = pointToIndex(ship.x, ship.y);
 			switch (ship.action) {
 			case ShipAction::NONE:
-                {
+            {
 				const float delta = m_halite[index] * Config::collect_rate;
 				m_halite[index] -= delta;
 				ship.cargo += delta;
-                }
+            }
 				break;
 			case ShipAction::CONVERT:
 				m_p0_halite -= Config::convert_cost;
-				m_shipyards.emplace_back(Shipyard{ship.x, ship.y, ShipyardAction::NONE});
 				m_has_ship[index] = false;
 				m_has_shipyard[index] = true;
+				remove_ships.push_back(ship.id);
+				add_shipyards.emplace_back(Shipyard{m_global_shipyard_id, ship.x, ship.y, ShipyardAction::NONE});
+				++m_global_shipyard_id;
 				break;
 			case ShipAction::MOVE_NORTH:
 				ship.y = (ship.y == Config::size - 1) ? 0 : ship.y + 1;
@@ -146,19 +152,32 @@ struct Board {
 			}
 			ship.action = ShipAction::NONE;
 			
-			if (m_shipyards.size() > 0 && ship.x == m_shipyards[0].x && ship.y == m_shipyards[0].y) {
-				m_p0_halite += ship.cargo;
-				ship.cargo = 0;
+			if (m_shipyard_map.size() > 0) {
+			    const auto& shipyard = m_shipyard_map.at(0);
+			    if (ship.x == shipyard.x && ship.y == shipyard.y) {
+                    m_p0_halite += ship.cargo;
+                    ship.cargo = 0;
+			    }
 			}
 		}
 
-		for (auto& shipyard : m_shipyards) {
+		for (auto& kv : m_shipyard_map) {
+		    auto& shipyard = kv.second;
 			if (shipyard.action == ShipyardAction::SPAWN) {
 				m_p0_halite -= Config::spawn_cost;
 				m_has_ship[pointToIndex(shipyard.x, shipyard.y)] = true;
-				m_ships.emplace_back(Ship{ shipyard.x, shipyard.y, 0.f, ShipAction::NONE });
+				m_ship_map.emplace(m_global_ship_id, Ship{m_global_ship_id, shipyard.x, shipyard.y, 0.f, ShipAction::NONE });
+				m_global_ship_id++;
 			}
 			shipyard.action = ShipyardAction::NONE;
+		}
+
+		for (auto id : remove_ships) {
+            m_ship_map.erase(id);
+        }
+
+		for (const auto& shipyard : add_shipyards) {
+		    m_shipyard_map.emplace(shipyard.id, shipyard);
 		}
 
 		for (int i = 0; i < Config::size * Config::size; ++i) {
@@ -172,7 +191,7 @@ struct Board {
 	    std::stringstream ss;
 	    for (int y = 0; y < Config::size; ++y) {
 	        for (int x = 0; x < Config::size; ++x) {
-	            const unsigned index = pointToIndex(x,y);
+	            const unsigned index = pointToIndex(x,Config::size-y-1);
 	            ss << "|";
 	            if (m_has_ship[index]) {
 	                ss << "a";
@@ -195,21 +214,32 @@ struct Board {
 
 	void setActions(const std::vector<unsigned>& _ship_actions,
 	        const std::vector<unsigned>& _shipyard_actions) {
-	    assert(_ship_actions.size() == m_ships.size());
-	    assert(_shipyard_actions.size() == m_shipyards.size());
-	    for (int i = 0; i < _ship_actions.size(); ++i) {
-	        m_ships[i].action = static_cast<ShipAction>(_ship_actions[i]);
+	    assert(_ship_actions.size() == m_ship_map.size());
+	    assert(_shipyard_actions.size() == m_shipyard_map.size());
+	    {
+            int i = 0;
+            for (auto& kv : m_ship_map) {
+                kv.second.action = static_cast<ShipAction>(_ship_actions[i]);
+                ++i;
+            }
 	    }
-	    for (int i = 0; i < _shipyard_actions.size(); ++i) {
-            m_shipyards[i].action = static_cast<ShipyardAction>(_shipyard_actions[i]);
-        }
+	    {
+            int i = 0;
+            for (auto& kv : m_shipyard_map) {
+                kv.second.action = static_cast<ShipyardAction>(_shipyard_actions[i]);
+                ++i;
+            }
+	    }
 	}
 
-	unsigned						m_step;
-	int								m_p0_halite;
-	std::vector<float>				m_halite; 
-	std::vector<Ship>				m_ships;
-	std::vector<Shipyard>			m_shipyards;
-	std::vector<bool>				m_has_ship;
-	std::vector<bool>				m_has_shipyard;
+	unsigned						    m_step;
+	int                                 m_global_ship_id;
+	int                                 m_global_shipyard_id;
+	float								m_p0_halite;
+	std::vector<float>				    m_halite;
+	std::vector<bool>				    m_has_ship;
+	std::vector<bool>				    m_has_shipyard;
+	std::map<int, Ship>                 m_ship_map;
+	std::map<int, Shipyard>             m_shipyard_map;
+
 };

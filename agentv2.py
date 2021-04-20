@@ -31,9 +31,9 @@ BOARD_SIZE = 11
 PLAYERS = 1
 GAMMA = 0.99
 TRAIN_BATCH_SIZE = 32
-TARGET_MODEL_UPDATE = 500
+TARGET_MODEL_UPDATE = 5000
 REWARD_GAME_COUNT_LEARNER = 300
-LEARNING_RATE = 0.005
+LEARNING_RATE = 0.01
 SHIP_CHANNELS = 2
 SHIPYARD_CHANNELS = 1
 MOMENTUM  = 0.9
@@ -44,7 +44,7 @@ SHIP_MOVE_ACTIONS = [None, ShipAction.NORTH,ShipAction.EAST,ShipAction.SOUTH,Shi
 TS_FTR_COUNT = 2 #1 + PLAYERS*2 
 GAME_COUNT = 10000
 TIMESTAMP = str(datetime.datetime.now()).replace(' ', '_').replace(':', '.').replace('-',"_")
-OUTPUT_HTML = True
+OUTPUT_HTML = False
 OUTPUT_REWARDS = False
 OUTPUT_HALITE = True
 PRINT_STATEMENTS = True
@@ -476,13 +476,13 @@ class AgentStateManager:
             
             ship_idxs = np.random.choice(
                 list(range(ship_end)), 
-                size=batch_size)
-#                 p=probs)
+                size=batch_size,
+                p=probs)
             
             weights = (ship_end * probs[ship_idxs])**(-min(1.0, self._beta + self._total_ship_samples * (1.0 - self._beta) / 50000))
             weights.div_(weights.max())
             print("loss weights: ", weights, file=LOG)
-            weights[:] = 1
+            #weights[:] = 1
             return (self._geo_ship_ftrs_t0[ship_idxs], 
                     self._ts_ship_ftrs_t0[ship_idxs],
                     self._geo_ship_ftrs_t1[ship_idxs], 
@@ -624,7 +624,8 @@ class AgentStateManager:
         geo_ftrs_ships_spawn_t1=None):
         
         current_model.train()
-        
+        if not np.allclose(ts_ftrs_t0[:,0] - ts_ftrs_t1[:,0],1/EPISODE_STEPS,atol=1e-6):
+            raise ValueError("ERRORRR") 
         Q_current = current_model(geo_ftrs_t0.detach(), ts_ftrs_t0.detach()).gather(1, actions.unsqueeze(1))
         
         if non_terminals.sum() > 0:
@@ -826,13 +827,13 @@ class DQN(nn.Module):
         self._channels = channels
         self.trained_examples = 0
         
-        height = DQN._compute_output_dim(BOARD_SIZE, kernel, stride, 0) 
+        height = DQN._compute_output_dim(BOARD_SIZE, 1, stride, 0) 
           
         locally_connected_layer = LocallyConnected2d(
             channels,
             filters,
             height,
-            kernel,
+            1,
             stride)
         self._conv_layers.append(locally_connected_layer)
         self._conv_layers.append(nn.Sigmoid())
@@ -843,18 +844,18 @@ class DQN(nn.Module):
             channels_in = filters * (2**(i))
             channels_out = filters * (2**(i+1))
             height = DQN._compute_output_dim(height, kernel, stride, pad)
-            #layer = nn.Conv2d(
-            #     channels_in,   # number of in channels (depth of input)
-            #     channels_out,    # out channels (depth, or number of filters)
-            #     kernel,     # size of convolving kernel
-            #     stride,     # stride of kernel
-            #     pad)        # padding
-            layer = LocallyConnected2d(
-                    channels_in,
-                    channels_out,
-                    height,
-                    kernel,
-                    stride)
+            layer = nn.Conv2d(
+                 channels_in,   # number of in channels (depth of input)
+                 channels_out,    # out channels (depth, or number of filters)
+                 kernel,     # size of convolving kernel
+                 stride,     # stride of kernel
+                 pad)        # padding
+            #layer = LocallyConnected2d(
+            #        channels_in,
+            #        channels_out,
+            #        height,
+            #        kernel,
+            #        stride)
             #nn.init.xavier_uniform_(layer.weight)
             bn = nn.BatchNorm2d(channels_out)
             activation = nn.ReLU()
@@ -868,14 +869,16 @@ class DQN(nn.Module):
         
         self._fc_v_layers = []
         for i in range(fc_layers):
-#             layer = NoisyLinear(
-#                 (height * height * channels_out + ts_ftrs) if i==0 else fc_volume, # number of neurons from previous layer
-#                 fc_volume, # number of neurons in output layer,
-#                 is_target_model)
-            layer = nn.Linear(
+            if not USE_EPSILON:
+                layer = NoisyLinear(
+                 (height * height * channels_out + ts_ftrs) if i==0 else fc_volume, # number of neurons from previous layer
+                 fc_volume, # number of neurons in output layer,
+                 is_target_model)
+            else:
+                layer = nn.Linear(
                 (height * height * channels_out + ts_ftrs) if i==0 else fc_volume,
                 fc_volume)
-            nn.init.xavier_uniform_(layer.weight)
+                nn.init.xavier_uniform_(layer.weight)
             #act = nn.ReLU()
             act = nn.Sigmoid()
             self._fc_v_layers.append(layer)
@@ -883,48 +886,51 @@ class DQN(nn.Module):
         
         self._fc_a_layers = []
         for i in range(fc_layers):
-#             layer = NoisyLinear(
-#                 (height * height * channels_out + ts_ftrs) if i==0 else fc_volume, # number of neurons from previous layer
-#                 fc_volume, # number of neurons in output layer,
-#                 is_target_model)
-            layer = nn.Linear(
+            if not USE_EPSILON:
+                layer = NoisyLinear(
+                 (height * height * channels_out + ts_ftrs) if i==0 else fc_volume, # number of neurons from previous layer
+                 fc_volume, # number of neurons in output layer,
+                 is_target_model)
+            else:
+                layer = nn.Linear(
                 (height * height * channels_out + ts_ftrs) if i==0 else fc_volume,
                 fc_volume)
-            nn.init.xavier_uniform_(layer.weight)            
+                nn.init.xavier_uniform_(layer.weight)            
 #             act = nn.ReLU()
             act = nn.Sigmoid()
             self._fc_a_layers.append(layer)
             self._fc_a_layers.append(act)
         
-#         self._fc_a_layers.append(
-#             NoisyLinear(
-#                 fc_volume, # number of neurons from previous layer
-#                 out_neurons, # number of neurons in output layer,
-#                 is_target_model))
-        
-        self._fc_a_layers.append(
+        if not USE_EPSILON:
+            self._fc_a_layers.append(
+             NoisyLinear(
+                 fc_volume, # number of neurons from previous layer
+                 out_neurons, # number of neurons in output layer,
+                 is_target_model))
+        else:
+            self._fc_a_layers.append(
             nn.Linear(
                 fc_volume, # number of neurons from previous layer
                 out_neurons))
-#         nn.init.xavier_uniform_(self._fc_a_layers[-1].weight)
+            nn.init.xavier_uniform_(self._fc_a_layers[-1].weight)
         
-#         self._fc_v_layers.append(
-#             NoisyLinear(
-#                 fc_volume, # number of neurons from previous layer
-#                 1, # number of neurons in output layer,
-#                 is_target_model))
-        
-        self._fc_v_layers.append(
+        if not USE_EPSILON:
+            self._fc_v_layers.append(
+             NoisyLinear(
+                 fc_volume, # number of neurons from previous layer
+                 1, # number of neurons in output layer,
+                 is_target_model))
+        else:
+            self._fc_v_layers.append(
             nn.Linear(
                 fc_volume,
                 1))
         
-#         nn.init.xavier_uniform_(self._fc_v_layers[-1].weight)
+            nn.init.xavier_uniform_(self._fc_v_layers[-1].weight)
         
         self.cnn = nn.Sequential(*self._conv_layers)
         self.advantage = nn.Sequential(*self._fc_a_layers)
         self.value = nn.Sequential(*self._fc_v_layers)
-#         nn.init.xavier_uniform_(self._final_layer.weight)
     
     def reset_noise(self):
         for layer in self._fc_a_layers:
@@ -935,15 +941,6 @@ class DQN(nn.Module):
                 layer.reset_noise()
             
     def forward(self, geometric_x, ts_x):
-#         if self._channels > 1:
-#             gates = [self._gates[i](geometric_x[:,i].unsqueeze(1)) for i in range(self._channels)]
-#             y = torch.mul(*gates)
-#             y = self.cnn(y)
-#         else:
-#         gates = [gate(geometric_x).view(-1, self._volumes[i]) 
-#                  for i, gate in enumerate(self._gates)]
-#         y = torch.cat(gates, dim=1)
-#         y = torch.cat((y, ts_x[:,0:2]), dim=1)
         y = self.cnn(geometric_x)
         y = y.view(-1, y.shape[1] * y.shape[2] * y.shape[3])
         y = torch.cat((y, ts_x[:,0:2]), dim=1) #@UndefinedVariable
@@ -1286,7 +1283,7 @@ class ActionSelector:
             converted_count = 0
             spawn_count = 1
         else:
-            if (USE_EPSILON and (np.random.rand() < 
+            if (TRAIN_MODELS and USE_EPSILON and (np.random.rand() < 
                 self.epsilon_end + 
                 (self.epsilon_start - self.epsilon_end) * 
                 math.exp(-1 * self.episode_index / self.epsilon_decay))):
@@ -1817,26 +1814,26 @@ agents = [agent]
 
 ship_dqn_cur = DQN(
     SHIP_CHANNELS,  # channels in
-    0,  # number of conv layers
-    3,  # number of fully connected layers at end
+    7,  # number of conv layers
+    1,  # number of fully connected layers at end
     32, # number of neurons in fully connected layers at end
-    16,  # number of start filters for conv layers (depth)
+    4,  # number of start filters for conv layers (depth)
     3,  # size of kernel
     1,  # stride of the kernel
-    0,  # padding
+    1,  # padding
     2,  # number of extra time series features
     6,   # out nerouns
     False # is target model?
 ).to(DEVICE) 
 ship_dqn_tar = DQN(
     SHIP_CHANNELS, # channels in
-    0,  # number of conv layers
-    3,  # number of fully connected layers at end
+    7,  # number of conv layers
+    1,  # number of fully connected layers at end
     32, # number of neurons in fully connected layers at end
-    16,  # number of start filters for conv layers (depth)
+    4,  # number of start filters for conv layers (depth)
     3,  # size of kernel
     1,  # stride of the kernel
-    0,  # padding
+    1,  # padding
     2,  # number of extra time series features
     6,   # out nerouns
     True # is target model?

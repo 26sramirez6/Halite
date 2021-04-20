@@ -18,6 +18,7 @@ enum class ShipyardAction {
 };
 
 struct Ship {
+    int id;
 	uint8_t x;
 	uint8_t y;
 	float cargo;
@@ -25,6 +26,7 @@ struct Ship {
 };
 
 struct Shipyard {
+    int id;
 	uint8_t x;
 	uint8_t y;
 	ShipyardAction action;

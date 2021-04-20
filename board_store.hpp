@@ -15,8 +15,8 @@ struct BoardStore {
 	using HalfMatF = Eigen::Array<float, half*Config::board_count, half>;
 	using FourthMatF = Eigen::Array<float, fourth*Config::board_count, fourth>;
 	inline void generate_boards() {
-		srand(time(NULL));
-		Eigen::Rand::Vmt19937_64 urng{ 0 };
+		srand(Config::random_seed);
+		Eigen::Rand::Vmt19937_64 urng{ Config::random_seed };
 		Eigen::Rand::ExtremeValueGen<float> gumbel1_gen(0, 300);
 		Eigen::Rand::ExtremeValueGen<float> gumbel2_gen(0, 500);
 		Eigen::Rand::BinomialGen<int> binomial_gen(1, .5);
